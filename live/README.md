@@ -23,7 +23,9 @@ flowchart LR
 
 带宽限制计入自定义头、IPv4 和 UDP 头；不包括 Wi-Fi MAC 开销、路由器缓冲和无线重传。RTSP 在 PC 本机产生，不占 3DS→PC 的这份预算。
 
-## 先测真机编码耗时
+## 可选：单独测真机编码耗时
+
+可以直接按下面的“PC 与 OBS”和“安装实验系统模块并试游戏”做推流测试；独立编码基准不是前置条件，适合在帧率不足时定位编码开销。
 
 在本机已构建的项目中，运行 `python live/package.py` 会生成 `live/dist/new3ds-live-test.zip`。解压后将 `sd-benchmark` 内的内容合并到 SD 根目录，在 Homebrew Launcher 启动 `live-bench.3dsx`。它不安装系统模块、不修改 Luma 配置，会写 SD 根目录 `/live-bench.csv`。样本文件存在时使用真实游戏视频的抽样画面，否则使用合成图案；控制台和包清单会注明。
 
@@ -65,7 +67,7 @@ python .\live\build.py
 
 ## 安装实验系统模块并试游戏
 
-完成编码基准后再进行此步。包的 `experimental-app/3ds-recorder.3dsx` 是包含本次系统模块的完整控制应用。先备份 SD 的 `/luma/sysmodules/0004013000F1D302.cxi` 和原应用；实验版沿用上游标题标识，不是独立安装槽位。原录制文件不需要迁移。
+可直接进行此步。包的 `experimental-app/3ds-recorder.3dsx` 是包含本次系统模块的完整控制应用。也可执行 `python live/package.py --stream-only --host PC的IPv4地址`，得到 `live/dist/new3ds-stream-test.zip`，将其中 `sd-stream` 内的内容合并到 SD 根目录，应用和 `live.ini` 即已就位。先备份 SD 的 `/luma/sysmodules/0004013000F1D302.cxi` 和原应用；实验版沿用上游标题标识，不是独立安装槽位。原录制文件不需要迁移。
 
 1. 将实验应用放在 SD `/3ds/`；将 `live.ini.example` 复制成 `/3ds/recorder/live.ini`，把 `host` 改成 PC 的局域网 IPv4 地址。默认 `codec=hybrid`、`fps=30`、`bytes_per_second=700000`。
 2. 按上游安装方式，Luma 开启 **Enable loading external FIRMs and modules**；启动实验应用，让它安装更新系统模块，并按应用提示重启。该安装会替换原系统模块。
