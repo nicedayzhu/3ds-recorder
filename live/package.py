@@ -12,6 +12,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--stream-only',action='store_true',help='Package the app and an SD-ready live.ini')
     parser.add_argument('--host',type=ipaddress.IPv4Address,help='PC IPv4 address for the SD configuration')
+    parser.add_argument('--profile',choices=('default','quality'),default='default',help='quality = 24 FPS / 800000 B/s JPEG')
     args=parser.parse_args()
     if args.stream_only and not args.host:parser.error('--stream-only requires --host PC_IP')
     files={
@@ -29,7 +30,8 @@ def main():
     if args.stream_only:
         files={name:path for name,path in files.items() if '/' not in name}
         files['sd-stream/3ds/3ds-recorder/3ds-recorder.3dsx']=ROOT/'app/3ds-recorder.3dsx'
-        config=(ROOT/'live/live.ini.example').read_text().replace('host=192.168.0.10',f'host={args.host}')
+        template='live-quality.ini.example' if args.profile=='quality' else 'live.ini.example'
+        config=(ROOT/'live'/template).read_text().replace('host=192.168.0.10',f'host={args.host}')
         generated['sd-stream/3ds/recorder/live.ini']=config.encode('ascii')
     else:
         for screen in ('top','bottom'):

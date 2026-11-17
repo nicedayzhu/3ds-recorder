@@ -30,5 +30,22 @@ class TestJPEG(unittest.TestCase):
             self.assertEqual(self.codec.jpeg(im,1024,0),b'')
     def test_invalid_dimensions(self):
         self.assertEqual(self.codec.jpeg(Image.new('RGB',(401,240)),12000),b'')
+    def test_scaled_quantization_and_budget(self):
+        for w in (320,400):
+            im=fixture(w,0)
+            sizes=[]
+            for quality in (1,10,25,50,75,95):
+                data=self.codec.jpeg(im,40000,quality,scaled=True)
+                with Image.open(io.BytesIO(data)) as out:
+                    out.load();self.assertEqual(out.size,im.size)
+                    scale=5000//quality if quality<50 else 200-2*quality
+                    self.assertEqual(out.quantization[0][0],max(1,min(255,(16*scale+50)//100)))
+                    self.assertEqual(out.quantization[1][0],max(1,min(255,(17*scale+50)//100)))
+                sizes.append(len(data))
+                capped=self.codec.jpeg(im,4000,quality,scaled=True)
+                self.assertLessEqual(len(capped),4000)
+            self.assertGreater(sizes[-1],sizes[0])
+            # At q50 the custom table is identical to the original medium table.
+            self.assertEqual(self.codec.jpeg(im,40000,50,scaled=True),self.codec.jpeg(im,40000,2))
 
 if __name__=='__main__':unittest.main()

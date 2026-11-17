@@ -17,6 +17,8 @@ class Codec:
         self.lib.live_decode.restype = C.c_int
         self.lib.live_jpeg_encode.argtypes=[C.c_void_p,C.c_uint,C.c_uint,C.c_uint,C.c_void_p,C.c_size_t]
         self.lib.live_jpeg_encode.restype=C.c_size_t
+        self.lib.live_jpeg_encode_scaled.argtypes=self.lib.live_jpeg_encode.argtypes
+        self.lib.live_jpeg_encode_scaled.restype=C.c_size_t
         self.scratch = Scratch()
     @staticmethod
     def pack(image):
@@ -34,9 +36,10 @@ class Codec:
         n=self.lib.live_encode(C.byref(self.scratch),raw,w,h,budget,out,len(out))
         if not n: raise ValueError('Frame dimensions or budget invalid')
         return out.raw[:n]
-    def jpeg(self,image,budget,quality=2):
+    def jpeg(self,image,budget,quality=2,scaled=False):
         raw=self.pack(image);out=C.create_string_buffer(b'\xa5'*(budget+64))
-        n=self.lib.live_jpeg_encode(raw,*image.size,quality,out,budget)
+        encode=self.lib.live_jpeg_encode_scaled if scaled else self.lib.live_jpeg_encode
+        n=encode(raw,*image.size,quality,out,budget)
         if out.raw[budget:budget+64]!=b'\xa5'*64:raise RuntimeError('JPEG wrote beyond budget')
         return out.raw[:n]
     def decode(self, packet):

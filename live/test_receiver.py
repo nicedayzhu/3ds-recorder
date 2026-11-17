@@ -1,12 +1,19 @@
 import struct
 import unittest
-from receiver import Assembler,HEADER,CHUNK
+from receiver import Assembler,HEADER,CHUNK,write_frame
 
 def fragments(seq=1,session=1):
     data=b'x'*3000
     return [HEADER.pack(b'R3LP',session,seq,123,0,len(data),off,30)+data[off:off+CHUNK]
             for off in range(0,len(data),CHUNK)]
 class TestReassembly(unittest.TestCase):
+    def test_short_pipe_writes(self):
+        class Pipe:
+            def __init__(self):self.data=bytearray()
+            def write(self,data):
+                count=min(17,len(data));self.data.extend(data[:count]);return count
+        pipe=Pipe();frame=bytes(range(256));write_frame(pipe,frame)
+        self.assertEqual(pipe.data,frame)
     def test_reorder_duplicate_and_late(self):
         a=Assembler();p=fragments();self.assertIsNone(a.feed(p[0],0))
         self.assertIsNone(a.feed(p[2],.01));self.assertIsNone(a.feed(p[2],.02))

@@ -16,7 +16,7 @@ def main():
         frames=[]
         for k in (0,1):
             im=fixture(w,k);budget=a.rate*93//100//a.fps*w//720
-            frames.append((c.jpeg(im,budget,2) if k==0 else b'') or c.encode(im,budget))
+            frames.append((c.jpeg(im,budget,60,scaled=True) if k==0 else b'') or c.encode(im,budget))
         bank.append(frames)
     sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);session=time.time_ns()&0xffffffff
     start=due=time.perf_counter();seq=0;sent=0

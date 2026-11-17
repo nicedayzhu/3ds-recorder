@@ -16,6 +16,14 @@ from codec import Codec
 HEADER=struct.Struct('<4s7I')
 CHUNK=1168
 
+def write_frame(pipe,data):
+    """Unbuffered pipes may perform a short write; never split the rawvideo clock."""
+    remaining=memoryview(data)
+    while remaining:
+        count=pipe.write(remaining)
+        if not count:raise BrokenPipeError('FFmpeg input closed')
+        remaining=remaining[count:]
+
 class Assembler:
     def __init__(self):
         self.session=None; self.frames={};self.last={};self.completed=set();self.retired=deque(maxlen=16)
@@ -58,7 +66,7 @@ def main():
     p.add_argument('--no-output',action='store_true',help='Receive and decode only')
     p.add_argument('--stats',help='Write per-interval CSV with actual received FPS and IP byte rate')
     a=p.parse_args(); decoder=Codec(); ass=Assembler(); lock=threading.Lock();stop=threading.Event()
-    screens=[bytes(400*240*3),bytes(320*240*3)];counts=[0,0];errors=[0];received=[0]
+    screens=[bytes(400*240*3),bytes(320*240*3)];counts=[0,0];errors=[0];received=[0];jpeg_counts=[0,0];ltc_counts=[0,0]
     sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,1024*1024);sock.bind((a.bind,a.port));sock.settimeout(.2)
     def receive():
@@ -80,19 +88,21 @@ def main():
                     else:
                         if struct.unpack_from('<HH',frame,4)!=(width,240):raise ValueError('Wrong screen size')
                         rgb=decoder.decode(frame)
-                    with lock:screens[sc]=rgb;counts[sc]+=1
+                    with lock:
+                        screens[sc]=rgb;counts[sc]+=1
+                        (jpeg_counts if frame.startswith(b'\xff\xd8') else ltc_counts)[sc]+=1
                 except (ValueError,OSError):errors[0]+=1
     thread=threading.Thread(target=receive,daemon=True);thread.start()
     ff=None;stats=None
     try:
         if a.stats:
             stats=open(a.stats,'w',encoding='utf-8',newline='')
-            stats.write('elapsed_s,top_fps,bottom_fps,ip_bytes_per_second,decode_errors\n')
+            stats.write('elapsed_s,top_fps,bottom_fps,ip_bytes_per_second,decode_errors,jpeg_top,jpeg_bottom,ltc1_top,ltc1_bottom\n')
         if not a.no_output:
             ff=subprocess.Popen(['ffmpeg','-hide_banner','-loglevel','warning','-f','rawvideo',
                 '-pixel_format','rgb24','-video_size','400x480','-framerate',str(a.fps),'-i','pipe:0',
-                '-an','-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-pix_fmt','yuv420p',
-                '-g',str(a.fps),'-bf','0','-f','rtsp','-rtsp_transport','tcp',a.rtsp],stdin=subprocess.PIPE)
+                '-an','-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-crf','10','-pix_fmt','yuv420p',
+                '-g',str(a.fps),'-bf','0','-flush_packets','1','-muxdelay','0','-f','rtsp','-rtsp_transport','tcp',a.rtsp],stdin=subprocess.PIPE,bufsize=0)
         print(f'Listening UDP {a.bind}:{a.port}, sender {a.sender}; output {a.rtsp}',flush=True)
         start=report=time.monotonic();due=start;previous=[0,0];last_bytes=0
         while not a.seconds or time.monotonic()-start<a.seconds:
@@ -103,15 +113,17 @@ def main():
                 with lock:top,bottom=screens
                 canvas=bytearray(top+bytes(400*240*3))
                 for y in range(240):canvas[((y+240)*400+40)*3:((y+240)*400+360)*3]=bottom[y*960:(y+1)*960]
-                ff.stdin.write(canvas)
+                write_frame(ff.stdin,canvas)
             now=time.monotonic()
             if now-report>=5:
                 dt=now-report
                 print(f'actual FPS top={(counts[0]-previous[0])/dt:.2f} bottom={(counts[1]-previous[1])/dt:.2f}; '
-                      f'IP bytes/s={(received[0]-last_bytes)/dt:.0f}; decode errors={errors[0]}',flush=True)
+                      f'IP bytes/s={(received[0]-last_bytes)/dt:.0f}; decode errors={errors[0]}; '
+                      f'JPEG={jpeg_counts} LTC1={ltc_counts}',flush=True)
                 if stats:
                     stats.write(f'{now-start:.3f},{(counts[0]-previous[0])/dt:.3f},'
-                                f'{(counts[1]-previous[1])/dt:.3f},{(received[0]-last_bytes)/dt:.0f},{errors[0]}\n')
+                                f'{(counts[1]-previous[1])/dt:.3f},{(received[0]-last_bytes)/dt:.0f},{errors[0]},'
+                                f'{jpeg_counts[0]},{jpeg_counts[1]},{ltc_counts[0]},{ltc_counts[1]}\n')
                     stats.flush()
                 previous=counts.copy();last_bytes=received[0];report=now
     except KeyboardInterrupt:pass

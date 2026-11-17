@@ -2161,6 +2161,7 @@ static void ConverterStep(void)
     }
     Slot *next = NULL;
     bool running = false;
+    static unsigned liveTurn;
     if (g_live)
     {
         /* Keep only the newest completed DMA for each screen. Never cancel a DMA in flight. */
@@ -2177,6 +2178,8 @@ static void ConverterStep(void)
             }
             else { __atomic_store_n(&s->state, 0, __ATOMIC_RELEASE); g_dropped++; }
         }
+        next=latest[liveTurn]?latest[liveTurn]:latest[liveTurn^1u];
+        if(next)liveTurn=next->screen^1u;
     }
     for (u32 i = 0; i < 2 * MAX_SLOTS; i++)
     {
@@ -2188,7 +2191,7 @@ static void ConverterStep(void)
            time, so the console's player took them for late and never showed them, and in the MP4
            the bottom screen ran behind the top one. The top screen keeps its lead where frames
            are captured (PollScreens: the bottom one waits behind a busy top screen). */
-        if (s->state == 2 && (!next || s->startTick < next->startTick ||
+        if (!g_live && s->state == 2 && (!next || s->startTick < next->startTick ||
                               (s->startTick == next->startTick && s->screen < next->screen)))
             next = s;
     }

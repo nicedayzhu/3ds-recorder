@@ -28,12 +28,17 @@ static volatile bool stopping;
 static struct sockaddr_in target;
 static u32 fps=30,rate=700000;
 static bool enabled;
-static bool hybrid=true;
-static unsigned quality[2]={2,2},spare[2];
+/* JPEG-only is the live default. LTC1 remains an explicit diagnostic choice. */
+static unsigned codecMode; /* 0 JPEG, 1 legacy hybrid, 2 LTC1 */
+static unsigned quality[2]={60,60},spare[2];
 static u32 frames[2],replaced,errors;
+static u32 attempts[2],jpegFrames[2],ltcFrames[2],oversize[2],maxUs[2],maxBytes[2];
+static u64 sumUs[2],started;
+static u32 expired;
+static int lastErrno;
 
 bool live_requested(void) {
-    enabled=false;fps=30;rate=700000;hybrid=true;
+    enabled=false;fps=30;rate=700000;codecMode=0;
     FILE *f=fopen("sdmc:/3ds/recorder/live.ini","r");
     if(!f)return false;
     char line[128],ip[64]="";unsigned port=8001;
@@ -44,7 +49,7 @@ bool live_requested(void) {
         else if(!strcmp(key,"port"))port=(unsigned)strtoul(val,NULL,10);
         else if(!strcmp(key,"fps"))fps=(u32)strtoul(val,NULL,10);
         else if(!strcmp(key,"bytes_per_second"))rate=(u32)strtoul(val,NULL,10);
-        else if(!strcmp(key,"codec"))hybrid=strcmp(val,"ltc1")!=0;
+        else if(!strcmp(key,"codec"))codecMode=!strcmp(val,"ltc1")?2:!strcmp(val,"hybrid")?1:0;
     }
     fclose(f);
     memset(&target,0,sizeof target);target.sin_family=AF_INET;
@@ -72,9 +77,9 @@ static void sender(void *unused) {
         for(u32 off=0;off<n&&!__atomic_load_n(&stopping,__ATOMIC_ACQUIRE);off+=1168) {
             u32 len=n-off>1168?1168:n-off;u8 packet[1200];
             u64 now=svcGetSystemTick();
-            if(now>deadline)break;
+            if(now>deadline){expired++;break;}
             if(due>now)svcSleepThread((due-now)*1000000000ull/SYSCLOCK_ARM11);
-            if(svcGetSystemTick()>deadline)break;
+            if(svcGetSystemTick()>deadline){expired++;break;}
             memcpy(packet,"R3LP",4);put32(packet+4,session);put32(packet+8,seq);put32(packet+12,stamp);
             put32(packet+16,sc);put32(packet+20,n);put32(packet+24,off);put32(packet+28,fps);
             memcpy(packet+32,sending+off,len);
@@ -82,7 +87,7 @@ static void sender(void *unused) {
             now=svcGetSystemTick();
             /* Includes IPv4+UDP headers; no claim to bound Wi-Fi retransmission airtime. */
             due=(now>due?now:due)+(u64)(len+60)*SYSCLOCK_ARM11/rate;
-            if(sent!=(int)(len+32)){errors++;break;}
+            if(sent!=(int)(len+32)){lastErrno=errno;errors++;break;}
             if(off+len==n)frames[sc]++;
         }
     }
@@ -97,7 +102,10 @@ Result live_start(void) {
     if(fd<0){live_stop();return -3;}
     if(fcntl(fd,F_SETFL,O_NONBLOCK)<0){live_stop();return -4;}
     LightLock_Init(&lock);memset(lengths,0,sizeof lengths);memset(frames,0,sizeof frames);
-    replaced=errors=0;quality[0]=quality[1]=2;spare[0]=spare[1]=0;
+    replaced=errors=expired=0;lastErrno=0;quality[0]=quality[1]=60;spare[0]=spare[1]=0;
+    memset(attempts,0,sizeof attempts);memset(jpegFrames,0,sizeof jpegFrames);memset(ltcFrames,0,sizeof ltcFrames);
+    memset(oversize,0,sizeof oversize);memset(sumUs,0,sizeof sumUs);memset(maxUs,0,sizeof maxUs);memset(maxBytes,0,sizeof maxBytes);
+    started=svcGetSystemTick();
     session=(u32)svcGetSystemTick();sequence=0;stopping=false;
     worker=threadCreate(sender,NULL,8192,0x3E,1,false);
     if(!worker){live_stop();return -5;}
@@ -111,20 +119,33 @@ void live_stop(void) {
     socbuf=NULL;
     FILE *f=fopen("sdmc:/3ds/recorder/live-stats.txt","w");
     if(f){fprintf(f,"sent_top=%lu\nsent_bottom=%lu\nreplaced=%lu\nsend_errors=%lu\nrate=%lu\nfps=%lu\n",
-                  frames[0],frames[1],replaced,errors,rate,fps);fclose(f);}
+                  frames[0],frames[1],replaced,errors,rate,fps);
+        fprintf(f,"duration_ms=%llu\nexpired_frames=%lu\nlast_send_errno=%d\ncodec_mode=%u\n",
+                (svcGetSystemTick()-started)*1000/SYSCLOCK_ARM11,expired,lastErrno,codecMode);
+        for(unsigned sc=0;sc<2;sc++)fprintf(f,
+            "screen%u_attempts=%lu\nscreen%u_jpeg=%lu\nscreen%u_ltc1=%lu\nscreen%u_oversize=%lu\n"
+            "screen%u_encode_mean_us=%llu\nscreen%u_encode_max_us=%lu\nscreen%u_max_bytes=%lu\nscreen%u_quality=%u\n",
+            sc,attempts[sc],sc,jpegFrames[sc],sc,ltcFrames[sc],sc,oversize[sc],
+            sc,attempts[sc]?sumUs[sc]/attempts[sc]:0,sc,maxUs[sc],sc,maxBytes[sc],sc,quality[sc]);
+        fclose(f);}
 }
 bool live_submit(int sc,const u8 *frame,u32 fmt,u32 stride,u32 pts,bool wide) {
     if(sc<0||sc>1||!worker||stopping||wide)return false;
+    u64 begin=svcGetSystemTick();
     u32 w=sc?320:400;
     if(!fb_to_rgb565(rgb565,frame,fmt,w,240,stride,1))return false;
     size_t budget=(rate*93/100/fps)*w/720;
-    size_t n=hybrid?live_jpeg_encode(rgb565,w,240,quality[sc],encoded,budget):0;
-    if(hybrid) {
-        if(!n){if(quality[sc]<3)quality[sc]++;spare[sc]=0;}
-        else if(n<budget*6/10){if(++spare[sc]>=30){if(quality[sc])quality[sc]--;spare[sc]=0;}}
+    size_t n=codecMode==2?0:live_jpeg_encode_scaled(rgb565,w,240,quality[sc],encoded,budget);
+    if(codecMode!=2) {
+        if(!n){oversize[sc]++;quality[sc]=quality[sc]>16?quality[sc]-6:10;spare[sc]=0;}
+        else if(n<budget*9/10){if(++spare[sc]>=8){if(quality[sc]<85)quality[sc]++;spare[sc]=0;}}
         else spare[sc]=0;
     }
-    if(!n)n=live_encode(&scratch,rgb565,w,240,budget,encoded,sizeof encoded);
+    if(n)jpegFrames[sc]++;
+    if(!n && codecMode!=0){n=live_encode(&scratch,rgb565,w,240,budget,encoded,sizeof encoded);if(n)ltcFrames[sc]++;}
+    u32 us=(u32)((svcGetSystemTick()-begin)*1000000/SYSCLOCK_ARM11);
+    attempts[sc]++;sumUs[sc]+=us;if(us>maxUs[sc])maxUs[sc]=us;
+    if(n>maxBytes[sc])maxBytes[sc]=(u32)n;
     if(!n)return false;
     LightLock_Lock(&lock);
     if(lengths[sc])replaced++;

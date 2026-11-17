@@ -19,12 +19,12 @@ def main():
     if not (ROOT/'third_party/JPEGENC/src/JPEGENC.h').exists():
         raise SystemExit('Run: git submodule update --init --recursive')
     jpeg=ROOT/'codec/source/live_jpeg.c'
-    run([gcc,'-O3','-std=c11','-Wall','-Wextra','-Werror','-shared','-fPIC','-I',inc,src,jpeg,'-o',BUILD/('livecodec.dll' if suffix=='dll' else 'liblivecodec.so')])
+    run([gcc,'-O3','-fno-strict-aliasing','-std=c11','-Wall','-Wextra','-Werror','-shared','-fPIC','-I',inc,src,jpeg,'-o',BUILD/('livecodec.dll' if suffix=='dll' else 'liblivecodec.so')])
     test=BUILD/('test_live.exe' if sys.platform=='win32' else 'test_live')
     run([gcc,'-O2','-std=c11','-Wall','-Wextra','-Werror','-I',inc,src,ROOT/'live/test_live.c','-o',test]);run([test])
     if a.arm:
         sdk=a.sdk.resolve();cc=sdk/'devkitARM/bin/arm-none-eabi-gcc';ctru=sdk/'libctru'
-        run([cc,'-O3','-std=gnu11','-Wall','-Wextra','-Werror','-march=armv6k','-mtune=mpcore','-mfloat-abi=hard','-mtp=soft',
+        run([cc,'-O3','-fno-strict-aliasing','-std=gnu11','-Wall','-Wextra','-Werror','-march=armv6k','-mtune=mpcore','-mfloat-abi=hard','-mtp=soft',
              '-D__3DS__','-I',ctru/'include','-I',inc,'-specs=3dsx.specs','-L',ctru/'lib',
              src,jpeg,ROOT/'live/arm_bench.c','-lctru','-lm','-o',BUILD/'live-bench.elf'])
         run([sdk/'tools/bin/3dsxtool',BUILD/'live-bench.elf',BUILD/'live-bench.3dsx'])
