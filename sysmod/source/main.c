@@ -2675,6 +2675,7 @@ static bool PaceTake(int sc)
    then on so a swap is caught within ~2 ms (the frame stays put until the game's next swap). */
 static u32 PollScreens(void)
 {
+    if (g_live) g_cfg.fps = live_fps();
     const u64 nowUs = TicksToUs64(Ticks() - g_recStartTick);
     const u32 gapUs = 1000000u / g_cfg.fps - 8000u;   /* 30 fps -> 25 ms: tolerates 60 Hz jitter */
     const u32 fill = RingFill();
@@ -2778,6 +2779,18 @@ static u32 PollScreens(void)
         Capture(sc, cur, fmt, stride, (u32)nowUs, isStatic);
     }
     g_lastPollUs = nowUs;
+    if (g_live)
+    {
+        /* Both latest requested DMAs must complete before a composite sample.
+           Do not wait for both game swap phases to be idle: asynchronous screen
+           swaps could otherwise starve the pair indefinitely. */
+        u32 mask = 0;
+        for (int sc = 0; sc < 2; sc++)
+            if (g_track[sc].hasCap && nowUs - g_track[sc].modeUs >= MODE_SETTLE_US)
+                mask |= 1u << sc;
+        live_schedule((u32)nowUs, (u32)g_track[0].lastCapUs, (u32)g_track[1].lastCapUs, mask);
+        return POLL_REC_US;
+    }
     /* a game faster than the recording: every poll, so its swaps' times are known (late captures) */
     for (int sc = 0; sc < 2; sc++)
         if ((sc == 0 ? g_cfg.top : g_cfg.bottom) && g_track[sc].hasCap && g_track[sc].swapGapUs < FAST_SWAP_US)

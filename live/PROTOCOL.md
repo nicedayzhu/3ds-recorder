@@ -1,4 +1,46 @@
-# R3LP version 1 (experimental)
+# R6 paired transport and legacy R3LP (experimental)
+
+## R6 / R3P2
+
+R6 sends independently decodable JPEGs in pairs. The 32-byte header below keeps
+its layout but uses `R3P2`; sequence and PTS are common to both screens. PTS is
+the composite sampling clock, not proof of simultaneous game rendering. The
+capture tracker may retain a non-swapping framebuffer; source reuse is logged.
+
+Each screen additionally sends two `R3F2` packets with the same metadata. Their
+offset field is the stripe index (0 or 1); payload is exactly 1168 bytes. Stripe
+g XORs zero-padded data fragments with fragment_index % 2 == g. One missing data
+fragment per stripe is recoverable if that parity packet and the other stripe
+members arrive. Two missing fragments in the same stripe are not recoverable.
+Data packets alternate screens; parity packets follow, also alternating screens.
+There is no retransmission or cross-pair decoding reference.
+
+The receiver retains at most two incomplete pairs, expires them after 80 ms and
+never presents an older sequence after a newer one. Both JPEGs must decode before
+either display changes. A late or unrecoverable pair is skipped as a unit.
+
+For each pair the sender reserves 4% of rate/fps, then accounts for four parity
+packets, JPEG bytes and every fragment's 60-byte application/IPv4/UDP overhead.
+Status packets use the same pacer. Exact calculations and all screen byte splits
+are checked in `test_pair.c`. This is a fixed cap without padding to fill idle
+bandwidth; Wi-Fi MAC retransmissions/airtime are not included. Packet-boundary
+tolerance still applies to arbitrary short measurement intervals.
+
+`R6CF` is a 20-byte little-endian control packet: magic, session, request sequence,
+FPS (24 or 30), rate (620000..1000000 B/s). It must originate from the configured
+receiver IP and UDP port. New settings are applied between sending pairs; a
+configuration epoch discards queued/encoding pairs from the previous settings.
+The capture loop reads the updated FPS. `R3ST` reports the actual settings; the
+receiver retries a request for at most five seconds. Runtime settings are not
+written to SD. `R3FB` is counted for diagnostics but never changes R6's budget.
+
+JPEG preparation caches exact RGB565 MCU tiles and unquantized DCT coefficients.
+Unchanged tiles skip conversion/DCT; quantization and entropy coding still emit
+a complete JPEG. The two workers share a quality parameter and total budget.
+There are at most three entropy passes per pair, with Q1 as the final emergency
+attempt; failure drops the whole pair. No temporal coefficients are transmitted.
+
+## Legacy R3LP version 1
 
 UDP payload is at most 1200 bytes: a 32-byte little-endian header followed by at most 1168 bytes of frame data. There is no negotiation, encryption, authentication, retransmission or audio. Use a trusted local network; the receiver restricts the source IP and the RTSP server binds loopback.
 

@@ -1,6 +1,5 @@
-"""Bounded UDP reassembly -> native C decoder -> FFmpeg -> local RTSP.
-The two screen frames are independent. Reports actual received FPS separately
-from the constant output clock (which repeats the last frame on loss).
+"""R6 paired UDP/FEC or legacy R3LP -> direct preview / local RTSP.
+Reports received complete screen pairs separately from the output clock.
 """
 import argparse
 from collections import deque
@@ -12,6 +11,7 @@ import threading
 import time
 from PIL import Image
 from codec import Codec
+from pair_protocol import PairAssembler,config_packet
 
 HEADER=struct.Struct('<4s7I')
 CHUNK=1168
@@ -37,13 +37,28 @@ def compose(top,bottom):
 
 class Preview:
     """Optional direct view of the same decoded frames, without a player queue."""
-    def __init__(self):
+    def __init__(self,configure=None):
         import tkinter as tk
+        from tkinter import ttk
         from PIL import ImageTk
         self.photo_class=ImageTk.PhotoImage
         self.root=tk.Tk();self.root.title('3DS Live - Direct Preview')
         self.root.resizable(False,False)
         self.label=tk.Label(self.root,borderwidth=0);self.label.pack()
+        controls=ttk.Frame(self.root);controls.pack(fill='x')
+        self.fps=tk.StringVar(value='30');self.rate=tk.StringVar(value='800000')
+        ttk.Label(controls,text='FPS').pack(side='left')
+        ttk.Combobox(controls,textvariable=self.fps,values=('30','24'),width=4,state='readonly').pack(side='left')
+        ttk.Label(controls,text='B/s').pack(side='left')
+        ttk.Combobox(controls,textvariable=self.rate,values=('700000','800000','900000','1000000'),width=9,state='readonly').pack(side='left')
+        def apply():
+            message=configure(int(self.fps.get()),int(self.rate.get())) if configure else 'No sender connected'
+            self.status.set(message)
+        ttk.Button(controls,text='Apply / 应用',command=apply).pack(side='left')
+        self.status=tk.StringVar(value='Waiting for R6 sender / 等待设备')
+        self.config_initialized=False
+        status_box=ttk.Frame(self.root,width=400,height=44);status_box.pack(fill='x');status_box.pack_propagate(False)
+        ttk.Label(status_box,textvariable=self.status,wraplength=400,justify='left').pack(fill='x')
         self.root.protocol('WM_DELETE_WINDOW',self.close)
     def show(self,canvas):
         if self.root is None:return
@@ -51,6 +66,13 @@ class Preview:
         self.label.configure(image=self.photo);self.root.update()
     def close(self):
         if self.root is not None:self.root.destroy();self.root=None
+    def poll(self):
+        if self.root is not None:self.root.update()
+    def set_status(self,text,settings=None):
+        if self.root is not None:
+            self.status.set(text)
+            if settings and settings[0] and not self.config_initialized:
+                self.fps.set(str(settings[0]));self.rate.set(str(settings[1]));self.config_initialized=True
 
 class RelativeDelay:
     """Arrival-delay growth above the session minimum; not absolute device latency."""
@@ -134,34 +156,80 @@ def main():
     p.add_argument('--no-output',action='store_true',help='Receive and decode only')
     p.add_argument('--preview',action='store_true',help='Show decoded screens directly for player-delay comparison')
     p.add_argument('--stats',help='Write per-interval CSV with actual received FPS and IP byte rate')
-    a=p.parse_args(); decoder=Codec(); ass=Assembler(); lock=threading.Lock();stop=threading.Event()
+    p.add_argument('--set-fps',type=int,choices=(24,30),help='Request R6 capture FPS once connected')
+    p.add_argument('--set-rate',type=int,choices=(700000,800000,900000,1000000),help='Request R6 fixed IPv4 B/s')
+    a=p.parse_args(); decoder=Codec(); ass=Assembler();paired=PairAssembler(); lock=threading.Lock();stop=threading.Event()
     screens=[bytes(400*240*3),bytes(320*240*3)];counts=[0,0];errors=[0];received=[0];jpeg_counts=[0,0];ltc_counts=[0,0]
     decode_max_us=[0]
     delay=RelativeDelay();lag_ms=[0.0];lag_max_ms=[0.0]
     remote=dict.fromkeys(STATUS_FIELDS,0);feedback_at=[0.0]
+    peer=[None];protocol=[None];request=[None];request_sent=[0.0];request_seq=[int(time.monotonic()*1000)&0xffffffff or 1]
+    initial_request=[a.set_fps is not None or a.set_rate is not None]
+    def configure(hz,bps):
+        if protocol[0]!='paired' or not peer[0] or not remote['sender_session']:return 'Waiting for R6 sender / 等待 R6'
+        with lock:
+            request_seq[0]=(request_seq[0]+1)&0xffffffff or 1
+            request[0]=(remote['sender_session'],request_seq[0],hz,bps,time.monotonic())
+        return f'Requested {hz} FPS / {bps} B/s; waiting for device'
+    def decode_frame(sc,frame):
+        width=400 if sc==0 else 320
+        if frame.startswith(b'\xff\xd8'):
+            with Image.open(io.BytesIO(frame)) as im:
+                if im.size!=(width,240):raise ValueError('Wrong screen size')
+                return im.convert('RGB').tobytes()
+        if len(frame)<8 or struct.unpack_from('<HH',frame,4)!=(width,240):raise ValueError('Wrong screen size')
+        return decoder.decode(frame)
     sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,1024*1024);sock.bind((a.bind,a.port));sock.settimeout(.2)
     def receive():
         while not stop.is_set():
             try:packet,addr=sock.recvfrom(1500)
-            except socket.timeout:continue
+            except socket.timeout:paired.expire(time.monotonic());continue
             except OSError:break
             if addr[0]!=a.sender:continue
             received[0]+=len(packet)+28
             now=time.monotonic()
+            pair_result=None
             if packet.startswith(b'R3ST'):
                 status=parse_status(packet)
-                if status and status['sender_session'] not in ass.retired and (ass.session is None or status['sender_session']==ass.session):
+                active=paired if protocol[0]=='paired' else ass
+                if status and status['sender_session'] not in active.retired and (active.session is None or status['sender_session']==active.session):
                     remote.update(status)
+                    with lock:
+                        if request[0] and (status['sender_fps'],status['sender_cap'])==request[0][2:4]:request[0]=None
                 result=None
-            else:result=ass.feed(packet,now)
-            if remote['sender_fps'] and (ass.session is None or remote['sender_session']==ass.session) and now-feedback_at[0]>=1:
+            elif packet.startswith((b'R3P2',b'R3F2')):
+                pair_result=paired.feed(packet,now);protocol[0]='paired';peer[0]=addr;result=None
+            else:result=ass.feed(packet,now);protocol[0]='legacy'
+            active=paired if protocol[0]=='paired' else ass
+            if initial_request[0] and protocol[0]=='paired' and remote['sender_session']:
+                configure(a.set_fps or remote['sender_fps'],a.set_rate or remote['sender_cap']);initial_request[0]=False
+            with lock:pending_request=request[0]
+            if pending_request and peer[0] and now-request_sent[0]>=.5:
+                if now-pending_request[4]<5:
+                    try:sock.sendto(config_packet(*pending_request[:4]),peer[0])
+                    except OSError:pass
+                    request_sent[0]=now
+                else:
+                    with lock:request[0]=None
+            if remote['sender_fps'] and (active.session is None or remote['sender_session']==active.session) and now-feedback_at[0]>=1:
                 feedback_at[0]=now
                 feedback=FEEDBACK.pack(b'R3FB',remote['sender_session'],int(now*1000)&0xffffffff,
-                    ass.metrics['udp_packets']&0xffffffff,sum(counts)&0xffffffff,
-                    ass.metrics['incomplete_frames']&0xffffffff,min(10000,int(lag_ms[0])))
+                    active.metrics['udp_packets']&0xffffffff,sum(counts)&0xffffffff,
+                    active.metrics['incomplete_frames']&0xffffffff,min(10000,int(lag_ms[0])))
                 try:sock.sendto(feedback,addr)
                 except OSError:pass
+            if pair_result:
+                payloads,session,seq,pts,hz=pair_result
+                lag_ms[0]=delay.sample(session,pts,now);lag_max_ms[0]=max(lag_max_ms[0],lag_ms[0])
+                decode_start=time.perf_counter_ns()
+                try:
+                    images=[decode_frame(sc,frame) for sc,frame in enumerate(payloads)]
+                    with lock:
+                        screens[:]=images
+                        for sc in range(2):counts[sc]+=1;jpeg_counts[sc]+=1
+                except (ValueError,OSError):errors[0]+=1
+                finally:decode_max_us[0]=max(decode_max_us[0],(time.perf_counter_ns()-decode_start)//1000)
             if result:
                 sc,frame=result
                 header=HEADER.unpack_from(packet)
@@ -169,14 +237,7 @@ def main():
                 lag_max_ms[0]=max(lag_max_ms[0],lag_ms[0])
                 decode_start=time.perf_counter_ns()
                 try:
-                    width=400 if sc==0 else 320
-                    if frame.startswith(b'\xff\xd8'):
-                        with Image.open(io.BytesIO(frame)) as im:
-                            if im.size!=(width,240):raise ValueError('Wrong screen size')
-                            rgb=im.convert('RGB').tobytes()
-                    else:
-                        if struct.unpack_from('<HH',frame,4)!=(width,240):raise ValueError('Wrong screen size')
-                        rgb=decoder.decode(frame)
+                    rgb=decode_frame(sc,frame)
                     with lock:
                         screens[sc]=rgb;counts[sc]+=1
                         (jpeg_counts if frame.startswith(b'\xff\xd8') else ltc_counts)[sc]+=1
@@ -185,12 +246,12 @@ def main():
     thread=threading.Thread(target=receive,daemon=True);thread.start()
     ff=None;stats=None;preview=None;write_max_us=0
     try:
-        if a.preview:preview=Preview()
+        if a.preview:preview=Preview(configure)
         if a.stats:
             stats=open(a.stats,'w',encoding='utf-8',newline='')
             stats.write('elapsed_s,top_fps,bottom_fps,ip_bytes_per_second,decode_errors,jpeg_top,jpeg_bottom,ltc1_top,ltc1_bottom,'+
                         ','.join(ass.metrics)+',decode_max_us,arrival_lag_ms,arrival_lag_max_ms,write_max_us,'+
-                        ','.join(STATUS_FIELDS)+'\n')
+                        ','.join(STATUS_FIELDS)+',complete_pairs,incomplete_pairs,fec_recovered\n')
         if not a.no_output:
             ff=subprocess.Popen(['ffmpeg','-hide_banner','-loglevel','warning','-f','rawvideo',
                 '-pixel_format','rgb24','-video_size','400x480','-framerate',str(a.fps),'-i','pipe:0',
@@ -198,15 +259,19 @@ def main():
                 '-g',str(a.fps),'-bf','0','-flush_packets','1','-muxdelay','0','-f','rtsp','-rtsp_transport','tcp',a.rtsp],stdin=subprocess.PIPE,bufsize=0)
         destination=a.rtsp if ff else 'direct preview' if preview else 'decode only'
         print(f'Listening UDP {a.bind}:{a.port}, sender {a.sender}; output {destination}',flush=True)
-        start=report=time.monotonic();due=start;previous=[0,0];last_bytes=0
+        start=report=time.monotonic();due=start;previous=[0,0];last_bytes=0;shown=[-1,-1]
         while not a.seconds or time.monotonic()-start<a.seconds:
             now=time.monotonic()
             if now<due:time.sleep(due-now)
-            due=max(due+1/a.fps,time.monotonic())
+            due=max(due+1/(120 if preview and not ff else a.fps),time.monotonic())
             if ff or preview:
-                with lock:top,bottom=screens
-                canvas=compose(top,bottom)
-                if preview:preview.show(canvas)
+                with lock:top,bottom=screens;current=counts.copy()
+                if ff or current!=shown:
+                    canvas=compose(top,bottom)
+                    if preview:preview.show(canvas)
+                    shown=current
+                elif preview:preview.poll()
+                if preview and preview.root is None and a.no_output:break
             if ff:
                 write_start=time.perf_counter_ns()
                 write_frame(ff.stdin,canvas)
@@ -214,18 +279,23 @@ def main():
             now=time.monotonic()
             if now-report>=5:
                 dt=now-report
+                metrics=(paired if protocol[0]=='paired' else ass).metrics
+                top_fps=(counts[0]-previous[0])/dt;bottom_fps=(counts[1]-previous[1])/dt
+                if preview:preview.set_status(f'Device {remote["sender_fps"]} FPS / {remote["sender_cap"]} B/s | received {top_fps:.1f}/{bottom_fps:.1f} | FEC {metrics.get("fec_recovered",0)}',
+                    (remote['sender_fps'],remote['sender_cap']))
                 print(f'actual FPS top={(counts[0]-previous[0])/dt:.2f} bottom={(counts[1]-previous[1])/dt:.2f}; '
                       f'IP bytes/s={(received[0]-last_bytes)/dt:.0f}; decode errors={errors[0]}; '
-                      f'JPEG={jpeg_counts} LTC1={ltc_counts}; incomplete={ass.metrics["incomplete_frames"]} '
-                      f'missing packets={ass.metrics["missing_fragments"]} late={ass.metrics["late_packets"]}; '
+                      f'JPEG={jpeg_counts} LTC1={ltc_counts}; incomplete={metrics["incomplete_frames"]} '
+                      f'missing packets={metrics["missing_fragments"]} late={metrics["late_packets"]}; '
                       f'budget={remote["sender_budget"]} feedback={remote["sender_feedback"]}',flush=True)
                 if stats:
                     stats.write(f'{now-start:.3f},{(counts[0]-previous[0])/dt:.3f},'
                                 f'{(counts[1]-previous[1])/dt:.3f},{(received[0]-last_bytes)/dt:.0f},{errors[0]},'
                                 f'{jpeg_counts[0]},{jpeg_counts[1]},{ltc_counts[0]},{ltc_counts[1]},'+
-                                ','.join(str(v) for v in ass.metrics.values())+
+                                ','.join(str(metrics[k]) for k in ass.metrics)+
                                 f',{decode_max_us[0]},{lag_ms[0]:.3f},{lag_max_ms[0]:.3f},{write_max_us},'+
-                                ','.join(str(remote[k]) for k in STATUS_FIELDS)+'\n')
+                                ','.join(str(remote[k]) for k in STATUS_FIELDS)+
+                                ','+','.join(str(metrics.get(k,0)) for k in ('complete_pairs','incomplete_pairs','fec_recovered'))+'\n')
                     stats.flush()
                 previous=counts.copy();last_bytes=received[0];report=now
     except KeyboardInterrupt:pass

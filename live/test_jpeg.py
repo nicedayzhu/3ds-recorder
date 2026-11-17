@@ -32,6 +32,31 @@ class TestJPEG(unittest.TestCase):
             self.assertEqual(self.codec.jpeg(im,1024,0),b'')
     def test_invalid_dimensions(self):
         self.assertEqual(self.codec.jpeg(Image.new('RGB',(401,240)),12000),b'')
+    def test_cached_dct_is_exact_reusable_and_bounded(self):
+        lib=self.codec.lib
+        lib.live_jpeg_prepare.argtypes=[C.c_uint,C.c_void_p,C.c_uint,C.c_uint]
+        lib.live_jpeg_render.argtypes=[C.c_uint,C.c_uint,C.c_void_p,C.c_size_t]
+        lib.live_jpeg_render.restype=C.c_size_t
+        for sc,w in enumerate((400,320)):
+            lib.live_jpeg_reset(sc)
+            out=C.create_string_buffer(b'\xa5'*40064)
+            self.assertEqual(lib.live_jpeg_render(sc,60,out,40000),0)
+            im=fixture(w,1);raw=self.codec.pack(im)
+            self.assertEqual(lib.live_jpeg_prepare(sc,raw,w,240),w*240//256)
+            self.assertEqual(lib.live_jpeg_prepare(sc,raw,w,240),0)
+            for q in (1,10,40,60,85,95):
+                expected=self.codec.jpeg(im,40000,q,scaled=True)
+                n=lib.live_jpeg_render(sc,q,out,40000)
+                self.assertEqual(out.raw[:n],expected)
+                self.assertEqual(out.raw[40000:40064],b'\xa5'*64)
+                small=C.create_string_buffer(b'\xa5'*1088)
+                n=lib.live_jpeg_render(sc,q,small,1024)
+                self.assertLessEqual(n,1024);self.assertEqual(small.raw[1024:],b'\xa5'*64+b'\0')
+            im.putpixel((5,5),(255,255,255));raw=self.codec.pack(im)
+            self.assertEqual(lib.live_jpeg_prepare(sc,raw,w,240),1)
+            expected=self.codec.jpeg(im,40000,50,scaled=True)
+            n=lib.live_jpeg_render(sc,50,out,40000)
+            self.assertEqual(out.raw[:n],expected)
     def test_scaled_quantization_and_budget(self):
         for w in (320,400):
             im=fixture(w,0)
@@ -68,5 +93,20 @@ class TestJPEG(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:list(pool.map(worker,cases))
         out=C.create_string_buffer(40000)
         self.assertEqual(fn(2,cases[0][3],400,240,75,out,40000),0)
+    def test_cached_contexts_concurrent(self):
+        lib=self.codec.lib
+        lib.live_jpeg_prepare.argtypes=[C.c_uint,C.c_void_p,C.c_uint,C.c_uint]
+        lib.live_jpeg_render.argtypes=[C.c_uint,C.c_uint,C.c_void_p,C.c_size_t];lib.live_jpeg_render.restype=C.c_size_t
+        cases=[]
+        for sc,w in enumerate((400,320)):
+            im=fixture(w,sc);q=(75,30)[sc]
+            cases.append((sc,w,self.codec.pack(im),q,self.codec.jpeg(im,40000,q,scaled=True)))
+        def worker(case):
+            sc,w,raw,q,expected=case;out=C.create_string_buffer(40000)
+            lib.live_jpeg_reset(sc)
+            for i in range(50):
+                self.assertEqual(lib.live_jpeg_prepare(sc,raw,w,240),0 if i else w*240//256)
+                n=lib.live_jpeg_render(sc,q,out,40000);self.assertEqual(out.raw[:n],expected)
+        with ThreadPoolExecutor(max_workers=2) as pool:list(pool.map(worker,cases))
 
 if __name__=='__main__':unittest.main()

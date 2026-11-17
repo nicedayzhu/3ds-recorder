@@ -26,6 +26,8 @@ def main():
     run([gcc,'-O2','-std=c11','-Wall','-Wextra','-Werror','-I',inc,ROOT/'live/test_pacing.c','-o',pacing]);run([pacing])
     rate_test=BUILD/('test_rate.exe' if sys.platform=='win32' else 'test_rate')
     run([gcc,'-O2','-std=c11','-Wall','-Wextra','-Werror','-I',inc,ROOT/'live/test_rate.c','-o',rate_test]);run([rate_test])
+    pair_test=BUILD/('test_pair.exe' if sys.platform=='win32' else 'test_pair')
+    run([gcc,'-O2','-std=c11','-Wall','-Wextra','-Werror','-I',inc,ROOT/'live/test_pair.c','-o',pair_test]);run([pair_test])
     if a.arm:
         sdk=a.sdk.resolve();cc=sdk/'devkitARM/bin/arm-none-eabi-gcc';ctru=sdk/'libctru'
         run([cc,'-O3','-fno-strict-aliasing','-std=gnu11','-Wall','-Wextra','-Werror','-march=armv6k','-mtune=mpcore','-mfloat-abi=hard','-mtp=soft',
