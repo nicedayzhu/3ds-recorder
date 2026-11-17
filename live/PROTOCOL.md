@@ -1,4 +1,28 @@
-# R6 paired transport and legacy R3LP (experimental)
+# R6/R7 paired transport and legacy R3LP (experimental)
+
+## R7 capability extension
+
+R7 keeps the R3P2/R3F2 header and R6CF command layout. Valid device FPS are
+15, 20, 24, 30; the fixed rate range is 400000..2000000 IPv4 B/s. The maximum
+single-screen JPEG length is 128000 bytes (R6: 40000). This is a parser/allocation
+bound, not permission to exceed the shared per-pair budget. Legacy R3LP remains
+limited to 40000 bytes and 24/30 FPS.
+
+Once per second R7 sends a **76-byte R7ST** packet: magic, the same 16 uint32
+fields listed under R5 status below, then maximum supported rate (2000000) and
+FPS mask `(1<<15)|(1<<20)|(1<<24)|(1<<30)`. All fields are little-endian. The
+sender charges 104 IPv4 bytes for this status packet. No R3ST is sent in parallel.
+
+The R7 receiver recognizes both R3ST and R7ST. For an R6 paired sender, R3ST
+implies maximum rate 1000000 and FPS mask `(1<<24)|(1<<30)`; the UI restricts
+choices accordingly. Capability fields are appended to CSV as `sender_max_rate`
+and `sender_fps_mask`. R7 retains the R6CF magic so the new PC can control R6.
+Old PC receivers cannot use R7's larger frames/new FPS and must be upgraded.
+Controls are runtime-only and still applied between pairs with an epoch change.
+
+The header's FPS is the configured paired sampling rate. It does not establish
+the game's render rate, and source reuse can still occur. No 60 FPS capability
+is advertised. New rates/FPS require hardware validation beyond host tests.
 
 ## R6 / R3P2
 

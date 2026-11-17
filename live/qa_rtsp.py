@@ -9,6 +9,8 @@ import time
 ROOT=Path(__file__).resolve().parents[1]
 def main():
     build=ROOT/'live/build'; logs=[]; processes=[]
+    with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as reserve:
+        reserve.bind(('127.0.0.1',0));port=reserve.getsockname()[1]
     def launch(args,name):
         log=(build/(name+'.log')).open('w');logs.append(log)
         process=subprocess.Popen(list(map(str,args)),cwd=ROOT,stdout=log,stderr=subprocess.STDOUT,
@@ -23,10 +25,10 @@ def main():
                 with socket.create_connection(('127.0.0.1',8554),timeout=.1):ready=True;break
             except OSError:time.sleep(.1)
         if not ready:raise RuntimeError('MediaMTX did not listen')
-        receiver=launch([sys.executable,'-u','live/receiver.py','--bind','127.0.0.1','--sender','127.0.0.1','--seconds','22',
+        receiver=launch([sys.executable,'-u','live/receiver.py','--bind','127.0.0.1','--port',str(port),'--sender','127.0.0.1','--seconds','22',
                          '--stats',build/'qa-receiver.csv'],'qa-receiver')
         time.sleep(1)
-        sender=launch([sys.executable,'-u','live/demo_sender.py','--seconds','18'],'qa-sender')
+        sender=launch([sys.executable,'-u','live/demo_sender.py','--port',str(port),'--seconds','18'],'qa-sender')
         time.sleep(3)
         probe=subprocess.run(['ffprobe','-v','error','-rtsp_transport','tcp','-read_intervals','%+3',
              '-count_frames','-select_streams','v:0','-show_entries','stream=codec_name,width,height,r_frame_rate,nb_read_frames',

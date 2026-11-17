@@ -1,12 +1,23 @@
 import struct
 import unittest
-from receiver import Assembler,HEADER,CHUNK,write_frame,RelativeDelay,compose,STATUS,parse_status
+from receiver import Assembler,HEADER,CHUNK,write_frame,RelativeDelay,compose,STATUS,STATUS7,parse_status
+from pair_protocol import FPS_MASK,FPS_OPTIONS
 
 def fragments(seq=1,session=1):
     data=b'x'*3000
     return [HEADER.pack(b'R3LP',session,seq,123,0,len(data),off,30)+data[off:off+CHUNK]
             for off in range(0,len(data),CHUNK)]
 class TestReassembly(unittest.TestCase):
+    def test_r7_capabilities_and_old_sender_limits(self):
+        values=[123,1000,2000000,2000000,30,30,30,29,29,0,0,1,2,3,22000,18000,2000000,FPS_MASK]
+        for fps in FPS_OPTIONS:
+            values[4]=fps;parsed=parse_status(STATUS7.pack(b'R7ST',*values))
+            self.assertEqual(parsed['sender_max_rate'],2000000);self.assertEqual(parsed['sender_fps'],fps)
+        values[2]=2000001;self.assertIsNone(parse_status(STATUS7.pack(b'R7ST',*values)))
+        values[2]=2000000;values[4]=60;self.assertIsNone(parse_status(STATUS7.pack(b'R7ST',*values)))
+        values[4]=30;values[-1]=1<<30
+        self.assertEqual(parse_status(STATUS7.pack(b'R7ST',*values))['sender_fps_mask'],1<<30)
+        values[4]=24;self.assertIsNone(parse_status(STATUS7.pack(b'R7ST',*values)))
     def test_status_bounds_and_separate_protocol(self):
         values=[123,1000,1000000,800000,30,30,30,29,29,0,0,1,2,3,22000,18000]
         packet=STATUS.pack(b'R3ST',*values)

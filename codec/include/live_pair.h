@@ -3,6 +3,10 @@
 #include <stdint.h>
 #define LIVE_CHUNK 1168u
 #define LIVE_PARITY 2u
+#define LIVE_MIN_RATE 400000u
+#define LIVE_MAX_RATE 2000000u
+#define LIVE_FPS_MASK ((1u<<15)|(1u<<20)|(1u<<24)|(1u<<30))
+static inline int live_valid_fps(uint32_t fps) { return fps==15||fps==20||fps==24||fps==30; }
 /* Two striped XOR packets per screen. Count all headers and parity in the
  * fixed budget. 4% headroom covers status and scheduling, never burst credit. */
 static inline uint32_t live_screen_wire(uint32_t bytes) {

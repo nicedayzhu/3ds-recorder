@@ -1,7 +1,7 @@
 <h1 align="center">3DS Recorder</h1>
 
 > **Experimental New 3DS live-streaming fork:** [双屏直播 / setup and validation](live/README.md).
-> Targets both screens at 24–30 FPS within 1 MB/s via a PC RTSP bridge. Hardware performance is **not yet validated**.
+> R6 reached 29.77 paired FPS in a 60-second New 3DS test at a 1 MB/s cap. R7 adds a hideable preview toolbar and 15/20/24/30 FPS, 0.4–2 MB/s options; the new device settings still need hardware testing. Direct preview and a local RTSP bridge are available.
 > Original project documentation follows below.
 
 <p align="center">

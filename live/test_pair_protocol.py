@@ -1,6 +1,6 @@
 import random
 import unittest
-from pair_protocol import PairAssembler,packetize,HEADER,CHUNK,config_packet
+from pair_protocol import PairAssembler,packetize,HEADER,CHUNK,config_packet,MAX_FRAME,FPS_OPTIONS
 
 class TestPairs(unittest.TestCase):
     def setUp(self):
@@ -51,12 +51,25 @@ class TestPairs(unittest.TestCase):
         a=PairAssembler();p=self.packets();a.feed(p[0],0)
         bad=bytearray(p[1]);bad[12]^=1
         self.assertIsNone(a.feed(bad,.001));self.assertEqual(a.metrics['invalid_packets'],1)
-        for total,offset in ((40001,0),(1,0),(9001,99999)):
+        for total,offset in ((MAX_FRAME+1,0),(1,0),(9001,99999)):
             bad=HEADER.pack(b'R3F2',1,1,123,0,total,offset,30)+bytes(CHUNK)
             self.assertIsNone(a.feed(bad,.002))
     def test_configuration_hard_bounds(self):
         self.assertEqual(len(config_packet(1,1,24,1000000)),20)
-        for hz,rate in ((60,800000),(30,1000001),(24,619999)):
+        for hz in FPS_OPTIONS:
+            for rate in (400000,1000000,2000000):self.assertEqual(len(config_packet(1,1,hz,rate)),20)
+        for hz,rate in ((60,800000),(30,2000001),(24,399999)):
             with self.assertRaises(ValueError):config_packet(1,1,hz,rate)
+    def test_larger_frames_and_new_fps_recover_exactly(self):
+        for fps in FPS_OPTIONS:
+            a=PairAssembler();self.top=bytes(range(256))*300;self.bottom=bytes(range(255,-1,-1))*180
+            packets=list(packetize(self.top,self.bottom,1,1,0,fps))
+            packets=packets[:4]+packets[8:]
+            result=None
+            for i,p in enumerate(packets):
+                value=a.feed(p,i*.0002)
+                if value:result=value
+            self.assertIsNotNone(result);self.assertEqual(result[0],(self.top,self.bottom))
+            self.assertEqual(a.metrics['fec_recovered'],4)
 
 if __name__=='__main__':unittest.main()

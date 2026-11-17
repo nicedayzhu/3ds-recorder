@@ -22,7 +22,7 @@ def main():
 export DEVKITARM="$DEVKITPRO/devkitARM"
 export PATH="$LIVE_TOOLS:$DEVKITARM/bin:$DEVKITPRO/tools/bin:/mingw64/bin:/usr/bin:$PATH"
 cd "$LIVE_REPO" || exit 1
-make -B -C sysmod -j2 && make -C plugin -j2 && make -B -C app -j2 APP_CHANNEL=live-r6
+make -B -C sysmod -j2 && make -C plugin -j2 && make -B -C app -j2 APP_CHANNEL=live-r7
 '''
     subprocess.run([str(a.bash),'-lc',script],env=env,check=True)
 if __name__=='__main__':main()

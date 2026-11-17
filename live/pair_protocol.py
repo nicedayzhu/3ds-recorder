@@ -6,11 +6,15 @@ HEADER=struct.Struct('<4s7I')
 CONFIG=struct.Struct('<4s4I')
 CHUNK=1168
 STRIPES=2
+FPS_OPTIONS=(15,20,24,30)
+RATE_OPTIONS=(400000,500000,600000,700000,800000,900000,1000000,1200000,1400000,1600000,1800000,2000000)
+FPS_MASK=sum(1<<fps for fps in FPS_OPTIONS)
+MAX_FRAME=128000
 
 def newer(a,b):return 0<((a-b)&0xffffffff)<0x80000000
 
 def config_packet(session,sequence,fps,rate):
-    if fps not in (24,30) or not 620000<=rate<=1000000:raise ValueError('Invalid FPS or rate')
+    if fps not in FPS_OPTIONS or not 400000<=rate<=2000000:raise ValueError('Invalid FPS or rate')
     return CONFIG.pack(b'R6CF',session,sequence,fps,rate)
 
 def packetize(top,bottom,session,sequence,pts,fps):
@@ -51,7 +55,7 @@ class PairAssembler:
             self.metrics['invalid_packets']+=1;return None
         magic,session,seq,pts,sc,total,offset,fps=HEADER.unpack_from(packet);data=packet[HEADER.size:]
         parity=magic==b'R3F2'
-        if (magic not in (b'R3P2',b'R3F2') or sc>1 or fps not in (24,30) or not 12<=total<=40000
+        if (magic not in (b'R3P2',b'R3F2') or sc>1 or fps not in FPS_OPTIONS or not 12<=total<=MAX_FRAME
             or (parity and (offset>=STRIPES or len(data)!=CHUNK))
             or (not parity and (offset>=total or offset%CHUNK or len(data)!=min(CHUNK,total-offset)))):
             self.metrics['invalid_packets']+=1;return None

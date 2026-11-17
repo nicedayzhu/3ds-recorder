@@ -14,7 +14,7 @@
 
 /* Encoder 0 coordinates pairs, encoder 1 handles bottom. The socket worker
  * owns rate changes and one latest complete pair. No temporal wire dependency. */
-#define MAX_JPEG 40000u
+#define MAX_JPEG LIVE_JPEG_MAX_BYTES
 static u16 rgb565[400*240],rawPending[2][400*240],rawWorking[2][400*240];
 static u8 encoded[2][MAX_JPEG],pending[2][MAX_JPEG],sending[2][MAX_JPEG];
 static bool rawValid[2],pendingReady,enabled,socReady;
@@ -56,7 +56,7 @@ bool live_requested(void) {
     fclose(f);memset(&target,0,sizeof target);target.sin_family=AF_INET;
     if(port<1||port>65535||inet_pton(AF_INET,ip,&target.sin_addr)!=1)enabled=false;
     target.sin_port=htons((u16)port);
-    if((fps!=24&&fps!=30)||rate<620000||rate>1000000)enabled=false;
+    if(!live_valid_fps(fps)||rate<LIVE_MIN_RATE||rate>LIVE_MAX_RATE)enabled=false;
     return enabled;
 }
 u32 live_fps(void){return __atomic_load_n(&fps,__ATOMIC_RELAXED);}
@@ -143,7 +143,7 @@ static void control(u64 *due) {
             if(n==28&&!memcmp(msg,"R3FB",4))feedbackCount++;
             if(n==20&&!memcmp(msg,"R6CF",4)) {
                 u32 seq=get32(msg+8),hz=get32(msg+12),bps=get32(msg+16);
-                if((hz!=24&&hz!=30)||bps<620000||bps>1000000||!seq)continue;
+                if(!live_valid_fps(hz)||bps<LIVE_MIN_RATE||bps>LIVE_MAX_RATE||!seq)continue;
                 if(configSequence&&(u32)(seq-configSequence)>=0x80000000u)continue;
                 configSequence=seq;
                 LightLock_Lock(&lock);
@@ -153,12 +153,13 @@ static void control(u64 *due) {
         }
     }
     if(now-lastStatusTick<SYSCLOCK_ARM11)return;
-    u8 msg[68];memcpy(msg,"R3ST",4);
+    u8 msg[76];memcpy(msg,"R7ST",4);
     const u32 values[]={session,(u32)((now-started)*1000/SYSCLOCK_ARM11),rate,rate,fps,
         live_encoded_frames(0),live_encoded_frames(1),frames[0],frames[1],errors,expired,feedbackCount,
         (u32)encoderCores[0],(u32)encoderCores[1],
-        __atomic_load_n(&lastEncodeUs[0],__ATOMIC_RELAXED),__atomic_load_n(&lastEncodeUs[1],__ATOMIC_RELAXED)};
-    for(unsigned i=0;i<16;i++)put32(msg+4+4*i,values[i]);
+        __atomic_load_n(&lastEncodeUs[0],__ATOMIC_RELAXED),__atomic_load_n(&lastEncodeUs[1],__ATOMIC_RELAXED),
+        LIVE_MAX_RATE,LIVE_FPS_MASK};
+    for(unsigned i=0;i<18;i++)put32(msg+4+4*i,values[i]);
     if(*due>now)svcSleepThread((*due-now)*1000000000ull/SYSCLOCK_ARM11);
     u64 begin=svcGetSystemTick();sendto(fd,msg,sizeof msg,0,(struct sockaddr*)&target,sizeof target);
     *due=live_packet_due(*due,begin,sizeof msg+28,rate,SYSCLOCK_ARM11);lastStatusTick=begin;
@@ -232,7 +233,7 @@ void live_stop(void) {
     if(worker){threadJoin(worker,U64_MAX);threadFree(worker);worker=NULL;}
     if(fd>=0){close(fd);fd=-1;}if(socReady){socExit();socReady=false;}
     FILE *f=fopen("sdmc:/3ds/recorder/live-stats.txt","w");if(!f)return;
-    fprintf(f,"version=live-r6\nsent_top=%lu\nsent_bottom=%lu\nreplaced=%lu\nsend_errors=%lu\nrate=%lu\nfps=%lu\n",
+    fprintf(f,"version=live-r7\nsent_top=%lu\nsent_bottom=%lu\nreplaced=%lu\nsend_errors=%lu\nrate=%lu\nfps=%lu\n",
         frames[0],frames[1],replaced,errors,rate,fps);
     fprintf(f,"duration_ms=%llu\nexpired_pairs=%lu\nlast_send_errno=%d\nadaptive=0\npair_jpeg_budget=%lu\n",
         (svcGetSystemTick()-started)*1000/SYSCLOCK_ARM11,expired,lastErrno,(u32)live_pair_budget(rate,fps));

@@ -10,7 +10,7 @@
 #include "live_jpeg.h"
 /* Upstream reserves 512 bytes ahead of each MCU. Separate physical headroom
  * from the network budget, otherwise a JPEG that fits can fail prematurely. */
-typedef struct { JPEGE_IMAGE image; uint8_t staging[40000+1024]; } LiveJpegState;
+typedef struct { JPEGE_IMAGE image; uint8_t staging[LIVE_JPEG_MAX_BYTES+1024]; } LiveJpegState;
 static LiveJpegState states[2];
 typedef struct {
     unsigned width;
@@ -46,7 +46,7 @@ static int scaled_tables(LiveJpegState *state,unsigned quality) {
 }
 static size_t encode(LiveJpegState *state,const uint16_t *src,unsigned w,unsigned h,unsigned quality,
                      unsigned scaled,uint8_t *out,size_t cap) {
-    if(!src||!out||h!=240||(w!=400&&w!=320)||cap<1024||cap>40000)return 0;
+    if(!src||!out||h!=240||(w!=400&&w!=320)||cap<1024||cap>LIVE_JPEG_MAX_BYTES)return 0;
     JPEGE_IMAGE *image=&state->image;uint8_t *staging=state->staging;
     memset(image,0,sizeof *image);
     image->pOutput=staging;image->iBufferSize=(int)cap+1024;image->pHighWater=staging+cap+512;
@@ -99,7 +99,7 @@ int live_jpeg_prepare(unsigned screen,const uint16_t *src,unsigned w,unsigned h)
 }
 
 size_t live_jpeg_render(unsigned screen,unsigned quality,uint8_t *out,size_t cap) {
-    if(screen>1||quality<1||quality>95||!out||cap<1024||cap>40000)return 0;
+    if(screen>1||quality<1||quality>95||!out||cap<1024||cap>LIVE_JPEG_MAX_BYTES)return 0;
     LiveJpegCache *cache=&caches[screen];unsigned w=cache->width;
     if(!w)return 0;
     LiveJpegState *state=&states[screen];JPEGE_IMAGE *im=&state->image;

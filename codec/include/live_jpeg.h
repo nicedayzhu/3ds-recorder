@@ -2,6 +2,7 @@
 #define LIVE_JPEG_H
 #include <stddef.h>
 #include <stdint.h>
+#define LIVE_JPEG_MAX_BYTES 128000u
 /* Legacy entry points use screen/context 0. quality 0=best .. 3=low. */
 size_t live_jpeg_encode(const uint16_t *column_rgb565,unsigned width,unsigned height,
                         unsigned quality,uint8_t *out,size_t capacity);

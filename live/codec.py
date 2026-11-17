@@ -1,5 +1,6 @@
 """Host bindings for the exact C codec used on ARM11."""
 import ctypes as C
+import os
 from pathlib import Path
 import sys
 
@@ -10,7 +11,8 @@ class Scratch(C.Structure):
 
 class Codec:
     def __init__(self):
-        self.lib = C.CDLL(str(ROOT/'live/build'/('livecodec.dll' if sys.platform=='win32' else 'liblivecodec.so')))
+        library=os.environ.get('LIVE_CODEC_LIBRARY') or ROOT/'live/build'/('livecodec.dll' if sys.platform=='win32' else 'liblivecodec.so')
+        self.lib = C.CDLL(str(library))
         self.lib.live_encode.argtypes = [C.c_void_p,C.c_void_p,C.c_uint,C.c_uint,C.c_size_t,C.c_void_p,C.c_size_t]
         self.lib.live_encode.restype = C.c_size_t
         self.lib.live_decode.argtypes = [C.c_void_p,C.c_size_t,C.c_void_p,C.c_size_t]

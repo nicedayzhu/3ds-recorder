@@ -1,5 +1,6 @@
 """Exercise the same embedded JPEG encoder with byte limits and rotated input."""
 import io
+import random
 import unittest
 import ctypes as C
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +33,26 @@ class TestJPEG(unittest.TestCase):
             self.assertEqual(self.codec.jpeg(im,1024,0),b'')
     def test_invalid_dimensions(self):
         self.assertEqual(self.codec.jpeg(Image.new('RGB',(401,240)),12000),b'')
+    def test_large_r7_frame_and_capacity_canary(self):
+        # High-detail input exceeds the R6 40 KB limit at Q95. The R7 shared
+        # pair budget can give most bytes to either screen at 15 FPS / 2 MB/s.
+        lib=self.codec.lib
+        lib.live_jpeg_prepare.argtypes=[C.c_uint,C.c_void_p,C.c_uint,C.c_uint]
+        lib.live_jpeg_render.argtypes=[C.c_uint,C.c_uint,C.c_void_p,C.c_size_t]
+        lib.live_jpeg_render.restype=C.c_size_t
+        for sc,w in enumerate((400,320)):
+            im=Image.frombytes('RGB',(w,240),random.Random(w).randbytes(w*240*3))
+            expected=self.codec.jpeg(im,128000,95,scaled=True)
+            self.assertGreater(len(expected),40000)
+            with Image.open(io.BytesIO(expected)) as decoded:
+                decoded.load();self.assertEqual(decoded.size,(w,240))
+            lib.live_jpeg_reset(sc);lib.live_jpeg_prepare(sc,self.codec.pack(im),w,240)
+            out=C.create_string_buffer(b'\xa5'*128064)
+            n=lib.live_jpeg_render(sc,95,out,128000)
+            self.assertEqual(out.raw[:n],expected)
+            self.assertEqual(out.raw[128000:128064],b'\xa5'*64)
+            self.assertEqual(lib.live_jpeg_render(sc,95,out,128001),0)
+            self.assertEqual(self.codec.jpeg(im,128001,95,scaled=True),b'')
     def test_cached_dct_is_exact_reusable_and_bounded(self):
         lib=self.codec.lib
         lib.live_jpeg_prepare.argtypes=[C.c_uint,C.c_void_p,C.c_uint,C.c_uint]
