@@ -3309,7 +3309,10 @@ static void UpdateBoost(void)
     const u64 now = Ticks();
     const u64 recUs = TicksToUs64(now - g_recStartTick);
     const bool appDrawing = g_appSwapSeen && recUs - g_appSwapUs < BOOST_APP_IDLE_US;
-    if (g_boosted && !appDrawing)
+    /* Live capture only hands off pixels; let it queue both screens before a
+       JPEG worker on the same core runs for a whole frame. */
+    if(g_live)SetBoost(true,"live capture handoff");
+    if (g_boosted && !appDrawing && !g_live)
     {
         SetBoost(false, "the application stopped drawing (HOME, an applet, a pause)");
         return;
@@ -3339,7 +3342,7 @@ static void UpdateBoost(void)
             Log("program in front: none (HOME) at %lu s", (u32)(TicksToUs64(now - g_recStartTick) / 1000000u));
         pid = p;
         since = now;
-        SetBoost(false, "another application or none");
+        if(!g_live)SetBoost(false, "another application or none");
         return;
     }
     if (p && appDrawing && now - since >= (u64)PRIO_BOOST_AFTER_US * (SYSCLOCK_ARM11 / 1000000u)) /* 64-bit: apps run for hours */

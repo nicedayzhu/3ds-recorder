@@ -15,6 +15,20 @@ from codec import Codec
 
 HEADER=struct.Struct('<4s7I')
 CHUNK=1168
+STATUS=struct.Struct('<4s16I')
+FEEDBACK=struct.Struct('<4s6I')
+STATUS_FIELDS=('sender_session','sender_elapsed_ms','sender_cap','sender_budget','sender_fps',
+    'sender_encoded_top','sender_encoded_bottom','sender_sent_top','sender_sent_bottom','sender_errors',
+    'sender_expired','sender_feedback','encoder_core_top','encoder_core_bottom','encoder_last_us_top','encoder_last_us_bottom')
+
+def parse_status(packet):
+    if len(packet)!=STATUS.size:return None
+    values=STATUS.unpack(packet)
+    if values[0]!=b'R3ST':return None
+    result=dict(zip(STATUS_FIELDS,values[1:]))
+    if (result['sender_fps'] not in (24,30) or not 400000<=result['sender_budget']<=result['sender_cap']<=1000000
+        or result['encoder_core_top']>3 or result['encoder_core_bottom']>3):return None
+    return result
 
 def compose(top,bottom):
     canvas=bytearray(top+bytes(400*240*3))
@@ -124,6 +138,7 @@ def main():
     screens=[bytes(400*240*3),bytes(320*240*3)];counts=[0,0];errors=[0];received=[0];jpeg_counts=[0,0];ltc_counts=[0,0]
     decode_max_us=[0]
     delay=RelativeDelay();lag_ms=[0.0];lag_max_ms=[0.0]
+    remote=dict.fromkeys(STATUS_FIELDS,0);feedback_at=[0.0]
     sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,1024*1024);sock.bind((a.bind,a.port));sock.settimeout(.2)
     def receive():
@@ -133,7 +148,20 @@ def main():
             except OSError:break
             if addr[0]!=a.sender:continue
             received[0]+=len(packet)+28
-            result=ass.feed(packet,time.monotonic())
+            now=time.monotonic()
+            if packet.startswith(b'R3ST'):
+                status=parse_status(packet)
+                if status and status['sender_session'] not in ass.retired and (ass.session is None or status['sender_session']==ass.session):
+                    remote.update(status)
+                result=None
+            else:result=ass.feed(packet,now)
+            if remote['sender_fps'] and (ass.session is None or remote['sender_session']==ass.session) and now-feedback_at[0]>=1:
+                feedback_at[0]=now
+                feedback=FEEDBACK.pack(b'R3FB',remote['sender_session'],int(now*1000)&0xffffffff,
+                    ass.metrics['udp_packets']&0xffffffff,sum(counts)&0xffffffff,
+                    ass.metrics['incomplete_frames']&0xffffffff,min(10000,int(lag_ms[0])))
+                try:sock.sendto(feedback,addr)
+                except OSError:pass
             if result:
                 sc,frame=result
                 header=HEADER.unpack_from(packet)
@@ -161,13 +189,15 @@ def main():
         if a.stats:
             stats=open(a.stats,'w',encoding='utf-8',newline='')
             stats.write('elapsed_s,top_fps,bottom_fps,ip_bytes_per_second,decode_errors,jpeg_top,jpeg_bottom,ltc1_top,ltc1_bottom,'+
-                        ','.join(ass.metrics)+',decode_max_us,arrival_lag_ms,arrival_lag_max_ms,write_max_us\n')
+                        ','.join(ass.metrics)+',decode_max_us,arrival_lag_ms,arrival_lag_max_ms,write_max_us,'+
+                        ','.join(STATUS_FIELDS)+'\n')
         if not a.no_output:
             ff=subprocess.Popen(['ffmpeg','-hide_banner','-loglevel','warning','-f','rawvideo',
                 '-pixel_format','rgb24','-video_size','400x480','-framerate',str(a.fps),'-i','pipe:0',
                 '-an','-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-crf','10','-pix_fmt','yuv420p',
                 '-g',str(a.fps),'-bf','0','-flush_packets','1','-muxdelay','0','-f','rtsp','-rtsp_transport','tcp',a.rtsp],stdin=subprocess.PIPE,bufsize=0)
-        print(f'Listening UDP {a.bind}:{a.port}, sender {a.sender}; output {a.rtsp}',flush=True)
+        destination=a.rtsp if ff else 'direct preview' if preview else 'decode only'
+        print(f'Listening UDP {a.bind}:{a.port}, sender {a.sender}; output {destination}',flush=True)
         start=report=time.monotonic();due=start;previous=[0,0];last_bytes=0
         while not a.seconds or time.monotonic()-start<a.seconds:
             now=time.monotonic()
@@ -187,13 +217,15 @@ def main():
                 print(f'actual FPS top={(counts[0]-previous[0])/dt:.2f} bottom={(counts[1]-previous[1])/dt:.2f}; '
                       f'IP bytes/s={(received[0]-last_bytes)/dt:.0f}; decode errors={errors[0]}; '
                       f'JPEG={jpeg_counts} LTC1={ltc_counts}; incomplete={ass.metrics["incomplete_frames"]} '
-                      f'missing packets={ass.metrics["missing_fragments"]} late={ass.metrics["late_packets"]}',flush=True)
+                      f'missing packets={ass.metrics["missing_fragments"]} late={ass.metrics["late_packets"]}; '
+                      f'budget={remote["sender_budget"]} feedback={remote["sender_feedback"]}',flush=True)
                 if stats:
                     stats.write(f'{now-start:.3f},{(counts[0]-previous[0])/dt:.3f},'
                                 f'{(counts[1]-previous[1])/dt:.3f},{(received[0]-last_bytes)/dt:.0f},{errors[0]},'
                                 f'{jpeg_counts[0]},{jpeg_counts[1]},{ltc_counts[0]},{ltc_counts[1]},'+
                                 ','.join(str(v) for v in ass.metrics.values())+
-                                f',{decode_max_us[0]},{lag_ms[0]:.3f},{lag_max_ms[0]:.3f},{write_max_us}\n')
+                                f',{decode_max_us[0]},{lag_ms[0]:.3f},{lag_max_ms[0]:.3f},{write_max_us},'+
+                                ','.join(str(remote[k]) for k in STATUS_FIELDS)+'\n')
                     stats.flush()
                 previous=counts.copy();last_bytes=received[0];report=now
     except KeyboardInterrupt:pass

@@ -2,6 +2,7 @@
 #include "live_codec.h"
 #include "live_jpeg.h"
 #include "live_pacing.h"
+#include "live_rate.h"
 #include "convert.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -46,9 +47,15 @@ static u32 expired;
 static int lastErrno;
 static u32 sendCalls,sendMaxUs;
 static u64 sendSumUs;
+static bool adaptive,feedbackReady;
+static LiveRate rateControl;
+static u32 budgetRate,feedbackCount,feedbackSequence,feedbackPackets,feedbackComplete,feedbackIncomplete,feedbackSent;
+static u32 rateDrops,rateRaises,lastEncodeUs[2];
+static u64 lastControlTick,lastStatusTick,lastFeedbackTick;
 
 bool live_requested(void) {
-    enabled=false;fps=30;rate=700000;codecMode=0;
+    if(worker)return enabled; /* Do not mutate live configuration mid-stream. */
+    enabled=false;fps=30;rate=700000;codecMode=0;adaptive=false;
     FILE *f=fopen("sdmc:/3ds/recorder/live.ini","r");
     if(!f)return false;
     char line[128],ip[64]="";unsigned port=8001;
@@ -60,6 +67,7 @@ bool live_requested(void) {
         else if(!strcmp(key,"fps"))fps=(u32)strtoul(val,NULL,10);
         else if(!strcmp(key,"bytes_per_second"))rate=(u32)strtoul(val,NULL,10);
         else if(!strcmp(key,"codec"))codecMode=!strcmp(val,"ltc1")?2:!strcmp(val,"hybrid")?1:0;
+        else if(!strcmp(key,"adaptive"))adaptive=!strcmp(val,"on");
     }
     fclose(f);
     memset(&target,0,sizeof target);target.sin_family=AF_INET;
@@ -72,8 +80,53 @@ bool live_requested(void) {
 u32 live_fps(void){return fps;}
 u32 live_encoded_frames(unsigned sc){return sc<2?__atomic_load_n(&jpegFrames[sc],__ATOMIC_RELAXED)+__atomic_load_n(&ltcFrames[sc],__ATOMIC_RELAXED):0;}
 static void put32(u8 *p,u32 n){for(unsigned i=0;i<4;i++)p[i]=(u8)(n>>(8*i));}
+static u32 get32(const u8 *p){return (u32)p[0]|(u32)p[1]<<8|(u32)p[2]<<16|(u32)p[3]<<24;}
+static void control(u64 *due) {
+    u64 now=svcGetSystemTick();
+    if(now-lastControlTick>=SYSCLOCK_ARM11/100) {
+        lastControlTick=now;
+        for(unsigned i=0;i<4;i++) {
+            u8 msg[64];struct sockaddr_in from;socklen_t size=sizeof from;
+            int n=recvfrom(fd,msg,sizeof msg,0,(struct sockaddr*)&from,&size);
+            if(n<0)break;
+            if(n!=28 || memcmp(msg,"R3FB",4) || get32(msg+4)!=session ||
+               from.sin_addr.s_addr!=target.sin_addr.s_addr || from.sin_port!=target.sin_port)continue;
+            u32 seq=get32(msg+8),packets=get32(msg+12),complete=get32(msg+16),incomplete=get32(msg+20),lag=get32(msg+24);
+            /* A receiver restart resets its cumulative counters. */
+            if(now-lastFeedbackTick>SYSCLOCK_ARM11*3ull)feedbackReady=false;
+            if(feedbackReady && ((u32)(packets-feedbackPackets)>0x80000000u ||
+               (u32)(complete-feedbackComplete)>0x80000000u || (u32)(incomplete-feedbackIncomplete)>0x80000000u))feedbackReady=false;
+            if(feedbackReady && (!((u32)(seq-feedbackSequence)) || (u32)(seq-feedbackSequence)>=0x80000000u))continue;
+            if(feedbackReady && now-lastFeedbackTick<SYSCLOCK_ARM11/2)continue;
+            if(feedbackReady && adaptive) {
+                u32 before=rateControl.current;
+                live_rate_update(&rateControl,sendCalls-feedbackSent,packets-feedbackPackets,
+                                 complete-feedbackComplete,incomplete-feedbackIncomplete,lag);
+                if(rateControl.current<before)rateDrops++;
+                if(rateControl.current>before)rateRaises++;
+                __atomic_store_n(&budgetRate,rateControl.current,__ATOMIC_RELAXED);
+            }
+            feedbackReady=true;feedbackSequence=seq;feedbackPackets=packets;feedbackComplete=complete;
+            feedbackIncomplete=incomplete;feedbackSent=sendCalls;feedbackCount++;lastFeedbackTick=now;
+        }
+    }
+    if(now-lastStatusTick>=SYSCLOCK_ARM11) {
+        u8 msg[68];memcpy(msg,"R3ST",4);
+        const u32 values[]={session,(u32)((now-started)*1000/SYSCLOCK_ARM11),rate,
+            __atomic_load_n(&budgetRate,__ATOMIC_RELAXED),fps,live_encoded_frames(0),live_encoded_frames(1),
+            frames[0],frames[1],errors,expired,feedbackCount,(u32)encoderCores[0],(u32)encoderCores[1],
+            __atomic_load_n(&lastEncodeUs[0],__ATOMIC_RELAXED),__atomic_load_n(&lastEncodeUs[1],__ATOMIC_RELAXED)};
+        for(unsigned i=0;i<16;i++)put32(msg+4+4*i,values[i]);
+        if(*due>now)svcSleepThread((*due-now)*1000000000ull/SYSCLOCK_ARM11);
+        u64 begin=svcGetSystemTick();
+        sendto(fd,msg,sizeof msg,0,(struct sockaddr*)&target,sizeof target);
+        *due=live_packet_due(*due,begin,sizeof msg+28,rate,SYSCLOCK_ARM11);
+        lastStatusTick=begin;
+    }
+}
 static void encoder(void *arg) {
     const unsigned sc=(unsigned)(uintptr_t)arg,w=sc?320:400;
+    size_t previousBudget=0,previousSize=0;
     while(!__atomic_load_n(&stopping,__ATOMIC_ACQUIRE)) {
         u32 stamp=0;u64 queued=0;bool ready;
         LightLock_Lock(&lock);ready=rawValid[sc];
@@ -87,7 +140,18 @@ static void encoder(void *arg) {
         u32 waitUs=(u32)((begin-queued)*1000000/SYSCLOCK_ARM11);
         if(waitUs>100000){rawExpired[sc]++;continue;}
         queueSumUs[sc]+=waitUs;if(waitUs>queueMaxUs[sc])queueMaxUs[sc]=waitUs;
-        size_t budget=(rate*93/100/fps)*w/720;
+        size_t budget=(__atomic_load_n(&budgetRate,__ATOMIC_RELAXED)*93/100/fps)*w/720;
+        /* When feedback shrinks the budget, lower quantization quality before
+           the next encode instead of waiting for a known-too-large frame. */
+        if(previousBudget>budget && previousSize>budget*9/10) {
+            unsigned q=quality[sc];
+            if(q>=50) {
+                unsigned scale=(unsigned)((200-2*q)*previousSize*10/(budget*9));
+                q=scale>=180?10:100-scale/2;
+            } else q=(unsigned)(q*budget*9/(previousSize*10));
+            quality[sc]=q<10?10:q;spare[sc]=0;
+        }
+        previousBudget=budget;
         size_t n=codecMode==2?0:live_jpeg_encode_screen(sc,rawWorking[sc],w,240,quality[sc],encoded[sc],budget);
         if(codecMode!=2) {
             if(!n){oversize[sc]++;quality[sc]=quality[sc]>16?quality[sc]-6:10;spare[sc]=0;}
@@ -96,7 +160,9 @@ static void encoder(void *arg) {
         }
         if(n)__atomic_add_fetch(&jpegFrames[sc],1,__ATOMIC_RELAXED);
         if(!n && codecMode!=0){n=live_encode(&scratch[sc],rawWorking[sc],w,240,budget,encoded[sc],sizeof encoded[sc]);if(n)__atomic_add_fetch(&ltcFrames[sc],1,__ATOMIC_RELAXED);}
+        if(n)previousSize=n;
         u32 us=(u32)((svcGetSystemTick()-begin)*1000000/SYSCLOCK_ARM11);
+        __atomic_store_n(&lastEncodeUs[sc],us,__ATOMIC_RELAXED);
         attempts[sc]++;sumUs[sc]+=us;if(us>maxUs[sc])maxUs[sc]=us;
         if(n>maxBytes[sc])maxBytes[sc]=(u32)n;
         if(!n || __atomic_load_n(&stopping,__ATOMIC_ACQUIRE))continue;
@@ -110,6 +176,7 @@ static void sender(void *unused) {
     (void)unused;unsigned next=0;
     u64 due=svcGetSystemTick();
     while(!__atomic_load_n(&stopping,__ATOMIC_ACQUIRE)) {
+        control(&due);
         u32 n=0,stamp=0,sc=0;
         LightLock_Lock(&lock);
         for(unsigned i=0;i<2;i++) {
@@ -157,6 +224,9 @@ Result live_start(void) {
     memset(convertCount,0,sizeof convertCount);memset(convertSumUs,0,sizeof convertSumUs);memset(convertMaxUs,0,sizeof convertMaxUs);
     memset(queueSumUs,0,sizeof queueSumUs);memset(queueMaxUs,0,sizeof queueMaxUs);
     started=svcGetSystemTick();
+    live_rate_init(&rateControl,rate);if(!adaptive)rateControl.current=rate;
+    budgetRate=rateControl.current;feedbackReady=false;feedbackCount=0;rateDrops=rateRaises=0;
+    lastControlTick=lastStatusTick=lastFeedbackTick=started;lastEncodeUs[0]=lastEncodeUs[1]=0;
     session=(u32)svcGetSystemTick();sequence=0;stopping=false;
     for(unsigned sc=0;sc<2;sc++) {
         LightEvent_Init(&rawEvent[sc],RESET_ONESHOT);
@@ -188,6 +258,8 @@ void live_stop(void) {
                 (svcGetSystemTick()-started)*1000/SYSCLOCK_ARM11,expired,lastErrno,codecMode);
         fprintf(f,"send_calls=%lu\nsend_mean_us=%llu\nsend_max_us=%lu\n",sendCalls,
                 sendCalls?sendSumUs/sendCalls:0,sendMaxUs);
+        fprintf(f,"adaptive=%u\nbudget_rate=%lu\nfeedback_count=%lu\nrate_drops=%lu\nrate_raises=%lu\n",
+                adaptive?1:0,budgetRate,feedbackCount,rateDrops,rateRaises);
         for(unsigned sc=0;sc<2;sc++)fprintf(f,
             "screen%u_attempts=%lu\nscreen%u_jpeg=%lu\nscreen%u_ltc1=%lu\nscreen%u_oversize=%lu\n"
             "screen%u_encode_mean_us=%llu\nscreen%u_encode_max_us=%lu\nscreen%u_max_bytes=%lu\nscreen%u_quality=%u\n"

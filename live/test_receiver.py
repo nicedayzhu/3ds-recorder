@@ -1,12 +1,20 @@
 import struct
 import unittest
-from receiver import Assembler,HEADER,CHUNK,write_frame,RelativeDelay,compose
+from receiver import Assembler,HEADER,CHUNK,write_frame,RelativeDelay,compose,STATUS,parse_status
 
 def fragments(seq=1,session=1):
     data=b'x'*3000
     return [HEADER.pack(b'R3LP',session,seq,123,0,len(data),off,30)+data[off:off+CHUNK]
             for off in range(0,len(data),CHUNK)]
 class TestReassembly(unittest.TestCase):
+    def test_status_bounds_and_separate_protocol(self):
+        values=[123,1000,1000000,800000,30,30,30,29,29,0,0,1,2,3,22000,18000]
+        packet=STATUS.pack(b'R3ST',*values)
+        self.assertEqual(parse_status(packet)['sender_budget'],800000)
+        self.assertIsNone(parse_status(packet[:-1]))
+        self.assertIsNone(parse_status(b'R3LP'+packet[4:]))
+        values[3]=1000001;self.assertIsNone(parse_status(STATUS.pack(b'R3ST',*values)))
+        values[3]=800000;values[4]=60;self.assertIsNone(parse_status(STATUS.pack(b'R3ST',*values)))
     def test_relative_delay_wrap_and_session_reset(self):
         d=RelativeDelay()
         self.assertEqual(d.sample(1,0xfffffff0,10),0)
