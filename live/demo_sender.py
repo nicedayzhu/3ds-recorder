@@ -28,8 +28,9 @@ def main():
                 packet=HEADER.pack(b'R3LP',session,seq,int((pair_start-start)*1e6)&0xffffffff,sc,len(frame),off,a.fps)+frame[off:off+CHUNK]
                 delay=due-time.perf_counter()
                 if delay>0:time.sleep(delay)
+                send_start=time.perf_counter()
                 sock.sendto(packet,(a.host,a.port));sent+=len(packet)+28
-                due=max(due,time.perf_counter())+(len(packet)+28)/a.rate
+                due=max(due,send_start)+(len(packet)+28)/a.rate
         delay=pair_start+1/a.fps-time.perf_counter()
         if delay>0:time.sleep(delay)
     elapsed=time.perf_counter()-start

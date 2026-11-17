@@ -1,6 +1,7 @@
 #include "live_stream.h"
 #include "live_codec.h"
 #include "live_jpeg.h"
+#include "live_pacing.h"
 #include "convert.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -36,6 +37,8 @@ static u32 attempts[2],jpegFrames[2],ltcFrames[2],oversize[2],maxUs[2],maxBytes[
 static u64 sumUs[2],started;
 static u32 expired;
 static int lastErrno;
+static u32 sendCalls,sendMaxUs;
+static u64 sendSumUs;
 
 bool live_requested(void) {
     enabled=false;fps=30;rate=700000;codecMode=0;
@@ -83,10 +86,12 @@ static void sender(void *unused) {
             memcpy(packet,"R3LP",4);put32(packet+4,session);put32(packet+8,seq);put32(packet+12,stamp);
             put32(packet+16,sc);put32(packet+20,n);put32(packet+24,off);put32(packet+28,fps);
             memcpy(packet+32,sending+off,len);
+            u64 sendStart=svcGetSystemTick();
             int sent=sendto(fd,packet,len+32,0,(struct sockaddr*)&target,sizeof target);
-            now=svcGetSystemTick();
+            u32 sendUs=(u32)((svcGetSystemTick()-sendStart)*1000000/SYSCLOCK_ARM11);
+            sendCalls++;sendSumUs+=sendUs;if(sendUs>sendMaxUs)sendMaxUs=sendUs;
             /* Includes IPv4+UDP headers; no claim to bound Wi-Fi retransmission airtime. */
-            due=(now>due?now:due)+(u64)(len+60)*SYSCLOCK_ARM11/rate;
+            due=live_packet_due(due,sendStart,len+60,rate,SYSCLOCK_ARM11);
             if(sent!=(int)(len+32)){lastErrno=errno;errors++;break;}
             if(off+len==n)frames[sc]++;
         }
@@ -103,6 +108,7 @@ Result live_start(void) {
     if(fcntl(fd,F_SETFL,O_NONBLOCK)<0){live_stop();return -4;}
     LightLock_Init(&lock);memset(lengths,0,sizeof lengths);memset(frames,0,sizeof frames);
     replaced=errors=expired=0;lastErrno=0;quality[0]=quality[1]=60;spare[0]=spare[1]=0;
+    sendCalls=sendMaxUs=0;sendSumUs=0;
     memset(attempts,0,sizeof attempts);memset(jpegFrames,0,sizeof jpegFrames);memset(ltcFrames,0,sizeof ltcFrames);
     memset(oversize,0,sizeof oversize);memset(sumUs,0,sizeof sumUs);memset(maxUs,0,sizeof maxUs);memset(maxBytes,0,sizeof maxBytes);
     started=svcGetSystemTick();
@@ -122,6 +128,8 @@ void live_stop(void) {
                   frames[0],frames[1],replaced,errors,rate,fps);
         fprintf(f,"duration_ms=%llu\nexpired_frames=%lu\nlast_send_errno=%d\ncodec_mode=%u\n",
                 (svcGetSystemTick()-started)*1000/SYSCLOCK_ARM11,expired,lastErrno,codecMode);
+        fprintf(f,"send_calls=%lu\nsend_mean_us=%llu\nsend_max_us=%lu\n",sendCalls,
+                sendCalls?sendSumUs/sendCalls:0,sendMaxUs);
         for(unsigned sc=0;sc<2;sc++)fprintf(f,
             "screen%u_attempts=%lu\nscreen%u_jpeg=%lu\nscreen%u_ltc1=%lu\nscreen%u_oversize=%lu\n"
             "screen%u_encode_mean_us=%llu\nscreen%u_encode_max_us=%lu\nscreen%u_max_bytes=%lu\nscreen%u_quality=%u\n",
