@@ -44,6 +44,11 @@ docs/*.mp4
 .DS_Store
 __pycache__/
 *.pyc
+/auto.crt
+/auto.key
+/live/results/*.png
+/live/results/*.jpg
+/live/dist/
 tests/host/test_unwrap
 tests/host/test_autostart
 tests/host/test_front

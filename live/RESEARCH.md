@@ -1,0 +1,56 @@
+# 双屏直播方案与实测记录
+
+日期：2026-11-17。这是开发实验记录，不是已达标的产品性能说明。
+
+## 预算与目标
+
+New 3DS 两屏共 172,800 像素。未压缩 RGB565 每对画面 345,600 B，30 FPS 需要 10.368 MB/s；上游 C420 约 1 B/像素，仍需约 5.184 MB/s（未计协议）。1,000,000 B/s 的上限要求每对画面含封包约 33,333 B。按实测 FTP 吞吐均值约 0.875 MB/s，首测设 0.70 MB/s，编码可用 21,700 B/对，约 15.9:1 相对于 RGB565。
+
+前台 FTP 数据不能证明后台游戏网络吞吐：sysmodule 的 SOC 权限、调度、可用内存和游戏 Wi-Fi 行为都需要单独测试。SDK 交叉编译通过只证明构建可行。
+
+## 方案选择
+
+| 候选 | 依据与代价 | 本轮处理 |
+|---|---|---|
+| JPEGENC JPEG 4:2:0 | 嵌入式 C 编码器、RGB565/MCU 输入、四档量化、不依赖 NEON；帧独立 | 固定提交并接入 ARMv6K 与主机同一套 C 代码 |
+| LTC1 两色块编码 | 固定最低字节数、按失真收益分配剩余预算、无需参考帧；纹理/文字画质较弱，CPU 仍需测 | JPEG 超预算时的完整帧回退，也可单独基准 |
+| libjpeg-turbo | 成熟 JPEG 库，但其 ARM SIMD 优化依赖 NEON；不能把现代 ARM 加速结果套到 ARM11 | 后续可与其标量路径对比，本轮未做 ARM 性能结论 |
+| minih264 | 上游已用于转换；有 plain-C 与 SSE2/NEON 路径，可提供帧间压缩 | 本轮未在 ARM11 游戏后台基准，不声称不能运行；暂把 H.264 放到 PC |
+| OBS 原生插件 | 可省去 PC 再编码和 RTSP 缓存，但需维护 OBS 插件构建与发布 | 首版采用可单独检验的 RTSP 桥接，插件暂未实现 |
+
+参考一手资料：[JPEGENC](https://github.com/bitbank2/JPEGENC)、[libjpeg-turbo](https://github.com/libjpeg-turbo/libjpeg-turbo)、[minih264 编译路径](https://github.com/lieff/minih264/blob/master/minih264e.h)。选择 JPEG 是当前工程取舍，并不是已证明在真机上最快。
+
+JPEGENC 固定在 `f51421bdaba8e098dc82130a17adaae6d61c3377`，Apache-2.0，子模块不改动。适配层按 16×16 MCU 读取 3DS 旋转 RGB565，并为库内部 MCU 安全空间提供独立 staging；最终只复制不超过网络预算的完整 JPEG。每帧预算超出时不连续重试多档 JPEG，避免最坏耗时膨胀。
+
+## 画质实验
+
+输入来自上游公开的 [New 3DS Resident Evil Revelations 演示录像](https://github.com/BolgarMaxym97/3ds-recorder/releases/download/v1.0.0/demo-new3ds-re-revelations.mp4)。使用 FFmpeg `fps=1/10` 抽取 5 组画面，再裁出 top `400:240:0:0`、bottom `320:240:40:240`。素材已经过上游录制/H.264 压缩，**不是原始 framebuffer**，也没有覆盖所有游戏。原录像与图片不提交到 Git；本地基准包使用第 2 组的 RGB565 样本。
+
+`evaluate.py` 对每屏、24/30 FPS、700,000/1,000,000 B/s 共 40 个条件测 RGB PSNR。表中的 JPEGENC 是离线选择四档中最好的可容纳档位；运行时只尝试当前自适应档位，因此这不是运行时平均画质。Pillow JPEG 只作为额外质量参考，不代表 ARM11 实现或速度。
+
+700,000 B/s、双屏 30 FPS 的结果：
+
+| 画面 | 每屏编码预算 | LTC1 PSNR | JPEGENC PSNR | JPEGENC 实际大小 |
+|---|---:|---:|---:|---:|
+| 上屏，5 帧 | 12,055 B | 28.81–31.09 dB | 34.05–37.43 dB | 9,059–11,352 B |
+| 下屏，5 帧 | 9,644 B | 22.54–22.93 dB | 26.46–26.87 dB | 8,928–9,403 B |
+
+原始数值见 [results/quality.csv](results/quality.csv)。LTC1 在同预算下保留了画面，但下屏文字/边缘明显较弱；JPEG 也仍有量化损失。采样结果支持 JPEG 为默认，不支持对所有场景的画质承诺。合成复杂纹理曾令 LTC1 降至约 15.5 dB，这也是保留真实内容基准的原因。
+
+## 已完成验证
+
+- MinGW 主机 C 测试：两种尺寸、低预算拒绝、预算遍历、方向、截断、20,000 份畸形随机输入。
+- 8 个 Python 测试：JPEG 解码/颜色/方向、不同预算的越界哨兵、非法尺寸；UDP 重复、乱序、丢帧恢复、超时、会话重启、序号回绕。
+- devkitARM ARMv6K 编译：`live-bench.3dsx`、`rec3ds.cxi`、配套完整 `3ds-recorder.3dsx`。sysmodule 的两个新编码器和基准均用 `-O3`；游戏采集和 RGB565 转换不包含在独立编码基准时间内。
+- 本机 MediaMTX v1.21.4 + FFmpeg + Python 集成：400×480 H.264 RTSP、标记 30/1 FPS，FFprobe 的约 3 秒区间读取 89 帧。预编码合成数据稳定段上下屏各约 28.20–28.22 FPS，IPv4 0.385–0.396 MB/s，解码错误 0。测试明确断言两屏收帧 >=24、带宽 <=700,000 加一个包容差；启动和结束段不用于帧率判定。
+
+RTSP 用法依据 [FFmpeg 协议文档](https://ffmpeg.org/ffmpeg-protocols.html#rtsp) 和 [MediaMTX 收发文档](https://mediamtx.org/docs/features/publish-and-read)。OBS 媒体源/VLC 源的选项见 [OBS 文档](https://obsproject.com/kb/media-sources)。本轮没有操作 OBS UI，没有测玻璃到玻璃延迟，没有真机网络测试；本机合成测试不能当作 New 3DS 性能。
+
+## 真机验收门槛与下一步
+
+1. 跑 `live-bench.3dsx`，反馈 CSV：两屏混合编码均值之和、P95、最大耗时及回退代价。编码已超过 33.33/41.67 ms 时，先优化转换、DCT 或块编码，不能用接收端重复帧掩盖。
+2. 在 New 3DS 上确认 SOC 初始化、模块启停、HOME/游戏切换和联网游戏共存。记录错误码与模块日志。
+3. 至少 3 个有双屏运动的场景各持续 120 秒；每屏实际接收 FPS 在目标范围，合计 IPv4 流量受限，检查画质、撕裂、丢帧和游戏自身速度。固定画面/游戏本身低帧率应单独标记。
+4. 用同机高速摄影或可识别时间码测端到端延迟；当前 PTS 只用于分片一致性，不实施两屏时钟同步。根据结果决定增加接收反馈、跨屏预算分配、更多 JPEG 量化档位或 OBS 原生源。
+
+当前状态：**功能原型与可复现测试完成；真机 24–30 FPS、后台带宽、延迟和游戏兼容性待验证。**

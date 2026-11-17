@@ -37,6 +37,8 @@
 #include "front.h"
 #include "plgring.h"
 #include "appletguard.h"
+#include "live_stream.h"
+static bool g_live;
 
 /* Luma custom SVCs (csvc.s) */
 Result svcControlMemoryUnsafe(u32 *out, u32 addr0, u32 size, MemOp op, MemPerm perm);
@@ -609,6 +611,8 @@ static u32 KeyByName(const char *n)
 
 static void LoadConfig(void)
 {
+    const bool configuredLive=live_requested();
+    if(configuredLive)g_cfg.replay=false;
     FILE *f = fopen(CONFIG_SD, "r");
     if (!f)
     {
@@ -658,7 +662,7 @@ static void LoadConfig(void)
                 g_cfg.hotkey = mask;
         }
         else if (strcasecmp(p, "replay") == 0)
-            g_cfg.replay = strcasecmp(v, "on") == 0;
+            g_cfg.replay = !configuredLive && strcasecmp(v, "on") == 0;
         else if (strcasecmp(p, "autostart") == 0)
             g_cfg.autostart = strcasecmp(v, "on") == 0;
         else if (strcasecmp(p, "fps") == 0)
@@ -1218,6 +1222,7 @@ static void ReplayRemoveFiles(void)
 
 static void PrepareNext(void)
 {
+    if (live_requested()) return;
     if (g_prepThread || g_prepFile || !g_sd || g_shutdownSeen || g_lidShut)
         return;
     const u32 freeMb = SdFreeMb();
@@ -1594,6 +1599,15 @@ static u32 EncodeFrame(int sc, const u8 *src, u32 fmt, u32 cols, u32 stride, u8 
    (single producer). */
 static void EncodeSlot(Slot *s, bool busy)
 {
+    if (g_live)
+    {
+        if (live_submit(s->screen, s->buf, s->fmt, s->stride, s->timeUs, s->wide))
+        {
+            if (s->screen) g_shared.framesBot++; else g_shared.framesTop++;
+        }
+        else g_dropped++;
+        return;
+    }
     const int sc = s->screen;
     const u32 cols = sc == 0 ? 400 : 320, rows = 240, words = cols * rows;
     const u32 maxLen = ((u32)codec_xr32_max_size(words) + 15u) & ~15u;
@@ -2147,6 +2161,23 @@ static void ConverterStep(void)
     }
     Slot *next = NULL;
     bool running = false;
+    if (g_live)
+    {
+        /* Keep only the newest completed DMA for each screen. Never cancel a DMA in flight. */
+        Slot *latest[2] = {NULL, NULL};
+        for (u32 i = 0; i < 2 * MAX_SLOTS; i++)
+        {
+            Slot *s = &g_slots[i];
+            if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != 2) continue;
+            Slot *old = latest[s->screen];
+            if (!old || s->startTick > old->startTick)
+            {
+                latest[s->screen] = s;
+                if (old) { __atomic_store_n(&old->state, 0, __ATOMIC_RELEASE); g_dropped++; }
+            }
+            else { __atomic_store_n(&s->state, 0, __ATOMIC_RELEASE); g_dropped++; }
+        }
+    }
     for (u32 i = 0; i < 2 * MAX_SLOTS; i++)
     {
         Slot *s = &g_slots[i];
@@ -2741,7 +2772,7 @@ static u32 PollScreens(void)
                 continue;
             }
         }
-        if (sc == 1 && g_cfg.top && BusySlots(0) >= 2 && nowUs - t->lastRealUs < BOTTOM_MIN_GAP_US)
+        if (!g_live && sc == 1 && g_cfg.top && BusySlots(0) >= 2 && nowUs - t->lastRealUs < BOTTOM_MIN_GAP_US)
             continue;   /* top screen first, but the bottom keeps 10 fps */
         t->lastRealUs = nowUs;
         Capture(sc, cur, fmt, stride, (u32)nowUs, isStatic);
@@ -4318,6 +4349,33 @@ static R3dFileHeader g_fileHdr;   /* this recording's file header (a clip's .r3d
 /* replay: the replay buffer (the stream goes round in a replay file), else a recording of its own. */
 static bool StartRecordingAs(bool replay)
 {
+    if (!replay && live_requested())
+    {
+        if (!IsNew3ds() || g_shutdownSeen) return false;
+        Result rc = live_start();
+        if (R_FAILED(rc)) { Log("live network init failed: %08lX", (u32)rc); g_shared.lastError=rc; return false; }
+        g_keepFree=KEEP_FREE;g_lite=false;g_inPlg=false;g_testVar=NULL;
+        for (int sc=0;sc<2;sc++)
+        {
+            g_arenaCap[sc]=ARENA_CAP[sc];g_arena[sc]=BigAlloc(g_arenaCap[sc]);
+            g_slotCount[sc]=g_slotSize[sc]=0;
+        }
+        g_ringSize=64*KB;g_ring=BigAlloc(g_ringSize);
+        if (!g_ring || !g_arena[0] || !g_arena[1]) { live_stop();BigFreeAll();return false; }
+        memset(g_slots,0,sizeof(g_slots));memset(g_track,0,sizeof(g_track));
+        g_w=g_r=0;g_ringOver=0;g_ringMirror=false;g_reserved=0;g_stageN=0;g_aq=NULL;g_audioReserve=false;
+        g_aqHead=g_aqTail=0;g_written=0;g_allocated=0;g_writeRc=0;g_file=0;
+        g_cfg.fps=live_fps();g_cfg.top=g_cfg.bottom=true;g_cfg.audioDebug=false;
+        g_paced=false;g_replay=false;g_writerActive=false;g_convHold=false;
+        g_dropped=g_throttled=0;memset(g_drops,0,sizeof(g_drops));
+        memset(g_encodeSumUs,0,sizeof(g_encodeSumUs));memset(g_encodeMaxUs,0,sizeof(g_encodeMaxUs));
+        g_shared.framesTop=g_shared.framesBot=0;g_shared.lastError=0;
+        g_convActive=g_convCount>1?1:0;g_convThread=g_convThreads[g_convActive];
+        g_recStartTick=Ticks();g_lastPollUs=0;g_live=true;
+        CpuBoost(true);g_recording=true;g_shared.state=REC_STATE_RECORDING;LedRecording();
+        Log("experimental live started: New3DS dual-screen %lu fps, video only",g_cfg.fps);
+        return true;
+    }
     if (g_shutdownSeen)   /* powering off / rebooting: nothing new */
         return false;
     const u64 startTick = Ticks();
@@ -4851,6 +4909,23 @@ static bool CloseReplay(bool save, u64 endUs, char *name, u32 nameSize)
 
 static void StopRecording(const char *why, bool releaseFirst)
 {
+    if (g_live)
+    {
+        g_savedOk=false;g_recording=false;g_convHold=true;__atomic_thread_fence(__ATOMIC_SEQ_CST);
+        while(g_convInSlot) svcSleepThread(1000000);
+        for(u32 i=0;i<2*MAX_SLOTS;i++)
+        {
+            Slot *s=&g_slots[i];
+            if(s->state==1 && s->dma){svcStopDma(s->dma);svcCloseHandle(s->dma);s->dma=0;}
+            s->state=0;
+        }
+        live_stop();
+        Log("live stopped (%s): encoded %lu/%lu; max encode us %lu/%lu; dropped %lu",why,
+            g_shared.framesTop,g_shared.framesBot,g_encodeMaxUs[0],g_encodeMaxUs[1],g_dropped);
+        g_live=false;g_ring=NULL;BigFreeAll();g_appPid=g_appBase=0;
+        CpuBoost(false);SetBoost(false,"live stopped");g_convHold=false;
+        g_shared.state=REC_STATE_IDLE;LoadConfig();LedOff();return;
+    }
     g_savedOk = false;
     const bool replay = g_replay, saveClip = g_replay && g_saveClip;
     const u64 endUs = TicksToUs64(Ticks() - g_recStartTick);
@@ -5675,13 +5750,13 @@ int main(void)
                 why = "user";
             else if (cmd == REC_CMD_EXIT)
                 why = "recorder exit";
-            else if (g_written + 8ull * MB >= MAX_FILE || TicksToUs64(now - g_recStartTick) >= MAX_REC_US) {
+            else if (!g_live && (g_written + 8ull * MB >= MAX_FILE || TicksToUs64(now - g_recStartTick) >= MAX_REC_US)) {
                 why = "file size (FAT32) or length limit: going on in a new file";
                 goOn = true;
             }
             else if (R_FAILED(g_writeRc))
                 why = "SD write error";
-            else if (now - lastSdCheck > 5ull * SYSCLOCK_ARM11)
+            else if (!g_live && now - lastSdCheck > 5ull * SYSCLOCK_ARM11)
             {
                 lastSdCheck = now;
                 g_shared.sdFreeMb = SdFreeMb();

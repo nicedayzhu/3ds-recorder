@@ -1,0 +1,29 @@
+{
+  "programs": [],
+  "stream_groups": [],
+  "streams": [
+    {
+      "codec_name": "h264",
+      "width": 400,
+      "height": 480,
+      "r_frame_rate": "30/1",
+      "nb_read_frames": "89"
+    }
+  ],
+  "steady_intervals": [
+    {
+      "elapsed_s": "10.032",
+      "top_fps": "28.199",
+      "bottom_fps": "28.199",
+      "ip_bytes_per_second": "395834",
+      "decode_errors": "0"
+    },
+    {
+      "elapsed_s": "15.064",
+      "top_fps": "28.217",
+      "bottom_fps": "28.217",
+      "ip_bytes_per_second": "385087",
+      "decode_errors": "0"
+    }
+  ]
+}

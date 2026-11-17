@@ -50,6 +50,7 @@ clean:
 	@rm -fr $(BUILD) $(TARGET).elf $(TARGET).cxi
 else
 DEPENDS := $(OFILES:.o=.d)
+live_codec.o live_jpeg.o: CFLAGS += -O3
 $(OUTPUT).elf: $(OFILES)
 -include $(DEPENDS)
 endif

@@ -106,6 +106,7 @@ AccessControlInfo:
     # k11ext skips SVC permission checks for them.
   InterruptNumbers:
   ServiceAccessControl:
+    - soc:U
     - fs:USER
     - mcu::HWC
     - ptm:u   # the lid (shell) state: no screen reads while the console sleeps

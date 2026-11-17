@@ -1,5 +1,9 @@
 <h1 align="center">3DS Recorder</h1>
 
+> **Experimental New 3DS live-streaming fork:** [双屏直播 / setup and validation](live/README.md).
+> Targets both screens at 24–30 FPS within 1 MB/s via a PC RTSP bridge. Hardware performance is **not yet validated**.
+> Original project documentation follows below.
+
 <p align="center">
   Record everything on your Nintendo 3DS — games, the HOME Menu and apps, both screens with sound.<br>
   Made in Ukraine 🇺🇦
