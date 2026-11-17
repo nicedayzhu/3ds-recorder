@@ -13,14 +13,21 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-/* One producer (the recorder converter), one network worker. No unbounded queue.
+/* One capture producer, one encoder per screen, one network worker. Bounded queues.
  * The worker alone owns the socket; a stopped worker is joined before SOC exits. */
-static LiveScratch scratch;
+static LiveScratch scratch[2];
 static u16 rgb565[400*240];
-static u8 encoded[LIVE_MAX_FRAME],pending[2][LIVE_MAX_FRAME],sending[LIVE_MAX_FRAME];
+static u16 rawPending[2][400*240],rawWorking[2][400*240];
+static u8 encoded[2][LIVE_MAX_FRAME],pending[2][LIVE_MAX_FRAME],sending[LIVE_MAX_FRAME];
+static bool rawValid[2];
+static u32 rawPts[2],rawReplaced[2],rawExpired[2],convertCount[2],convertMaxUs[2],queueMaxUs[2];
+static u64 rawQueuedAt[2],convertSumUs[2],queueSumUs[2];
 static u32 lengths[2],stamps[2],sequence,session;
 static LightLock lock;
 static Thread worker;
+static Thread encoders[2];
+static LightEvent rawEvent[2];
+static s32 encoderCores[2];
 static int fd=-1;
 static u32 *socbuf;
 static u32 socStorage[0x100000/sizeof(u32)] __attribute__((aligned(0x1000)));
@@ -63,7 +70,42 @@ bool live_requested(void) {
     return enabled;
 }
 u32 live_fps(void){return fps;}
+u32 live_encoded_frames(unsigned sc){return sc<2?__atomic_load_n(&jpegFrames[sc],__ATOMIC_RELAXED)+__atomic_load_n(&ltcFrames[sc],__ATOMIC_RELAXED):0;}
 static void put32(u8 *p,u32 n){for(unsigned i=0;i<4;i++)p[i]=(u8)(n>>(8*i));}
+static void encoder(void *arg) {
+    const unsigned sc=(unsigned)(uintptr_t)arg,w=sc?320:400;
+    while(!__atomic_load_n(&stopping,__ATOMIC_ACQUIRE)) {
+        u32 stamp=0;u64 queued=0;bool ready;
+        LightLock_Lock(&lock);ready=rawValid[sc];
+        if(ready) {
+            memcpy(rawWorking[sc],rawPending[sc],w*240*2);
+            stamp=rawPts[sc];queued=rawQueuedAt[sc];rawValid[sc]=false;
+        }
+        LightLock_Unlock(&lock);
+        if(!ready){LightEvent_WaitTimeout(&rawEvent[sc],100000000);continue;}
+        const u64 begin=svcGetSystemTick();
+        u32 waitUs=(u32)((begin-queued)*1000000/SYSCLOCK_ARM11);
+        if(waitUs>100000){rawExpired[sc]++;continue;}
+        queueSumUs[sc]+=waitUs;if(waitUs>queueMaxUs[sc])queueMaxUs[sc]=waitUs;
+        size_t budget=(rate*93/100/fps)*w/720;
+        size_t n=codecMode==2?0:live_jpeg_encode_screen(sc,rawWorking[sc],w,240,quality[sc],encoded[sc],budget);
+        if(codecMode!=2) {
+            if(!n){oversize[sc]++;quality[sc]=quality[sc]>16?quality[sc]-6:10;spare[sc]=0;}
+            else if(n<budget*9/10){if(++spare[sc]>=8){if(quality[sc]<85)quality[sc]++;spare[sc]=0;}}
+            else spare[sc]=0;
+        }
+        if(n)__atomic_add_fetch(&jpegFrames[sc],1,__ATOMIC_RELAXED);
+        if(!n && codecMode!=0){n=live_encode(&scratch[sc],rawWorking[sc],w,240,budget,encoded[sc],sizeof encoded[sc]);if(n)__atomic_add_fetch(&ltcFrames[sc],1,__ATOMIC_RELAXED);}
+        u32 us=(u32)((svcGetSystemTick()-begin)*1000000/SYSCLOCK_ARM11);
+        attempts[sc]++;sumUs[sc]+=us;if(us>maxUs[sc])maxUs[sc]=us;
+        if(n>maxBytes[sc])maxBytes[sc]=(u32)n;
+        if(!n || __atomic_load_n(&stopping,__ATOMIC_ACQUIRE))continue;
+        LightLock_Lock(&lock);
+        if(lengths[sc])replaced++;
+        memcpy(pending[sc],encoded[sc],n);lengths[sc]=(u32)n;stamps[sc]=stamp;
+        LightLock_Unlock(&lock);
+    }
+}
 static void sender(void *unused) {
     (void)unused;unsigned next=0;
     u64 due=svcGetSystemTick();
@@ -111,14 +153,30 @@ Result live_start(void) {
     sendCalls=sendMaxUs=0;sendSumUs=0;
     memset(attempts,0,sizeof attempts);memset(jpegFrames,0,sizeof jpegFrames);memset(ltcFrames,0,sizeof ltcFrames);
     memset(oversize,0,sizeof oversize);memset(sumUs,0,sizeof sumUs);memset(maxUs,0,sizeof maxUs);memset(maxBytes,0,sizeof maxBytes);
+    memset(rawValid,0,sizeof rawValid);memset(rawReplaced,0,sizeof rawReplaced);memset(rawExpired,0,sizeof rawExpired);
+    memset(convertCount,0,sizeof convertCount);memset(convertSumUs,0,sizeof convertSumUs);memset(convertMaxUs,0,sizeof convertMaxUs);
+    memset(queueSumUs,0,sizeof queueSumUs);memset(queueMaxUs,0,sizeof queueMaxUs);
     started=svcGetSystemTick();
     session=(u32)svcGetSystemTick();sequence=0;stopping=false;
+    for(unsigned sc=0;sc<2;sc++) {
+        LightEvent_Init(&rawEvent[sc],RESET_ONESHOT);
+        encoderCores[sc]=(s32)(sc+2);
+        encoders[sc]=threadCreate(encoder,(void*)(uintptr_t)sc,8192,0x3E,encoderCores[sc],false);
+        if(!encoders[sc]) {
+            encoderCores[sc]=1;
+            encoders[sc]=threadCreate(encoder,(void*)(uintptr_t)sc,8192,0x3E,1,false);
+        }
+        if(!encoders[sc]){live_stop();return -6;}
+    }
     worker=threadCreate(sender,NULL,8192,0x3E,1,false);
     if(!worker){live_stop();return -5;}
     return 0;
 }
 void live_stop(void) {
     __atomic_store_n(&stopping,true,__ATOMIC_RELEASE);
+    for(unsigned sc=0;sc<2;sc++)if(encoders[sc]) {
+        LightEvent_Signal(&rawEvent[sc]);threadJoin(encoders[sc],U64_MAX);threadFree(encoders[sc]);encoders[sc]=NULL;
+    }
     if(worker){threadJoin(worker,U64_MAX);threadFree(worker);worker=NULL;}
     if(fd>=0){close(fd);fd=-1;}
     if(socReady){socExit();socReady=false;}
@@ -132,9 +190,14 @@ void live_stop(void) {
                 sendCalls?sendSumUs/sendCalls:0,sendMaxUs);
         for(unsigned sc=0;sc<2;sc++)fprintf(f,
             "screen%u_attempts=%lu\nscreen%u_jpeg=%lu\nscreen%u_ltc1=%lu\nscreen%u_oversize=%lu\n"
-            "screen%u_encode_mean_us=%llu\nscreen%u_encode_max_us=%lu\nscreen%u_max_bytes=%lu\nscreen%u_quality=%u\n",
+            "screen%u_encode_mean_us=%llu\nscreen%u_encode_max_us=%lu\nscreen%u_max_bytes=%lu\nscreen%u_quality=%u\n"
+            "screen%u_encoder_core=%ld\nscreen%u_raw_replaced=%lu\nscreen%u_raw_expired=%lu\n"
+            "screen%u_convert_mean_us=%llu\nscreen%u_convert_max_us=%lu\nscreen%u_queue_mean_us=%llu\nscreen%u_queue_max_us=%lu\n",
             sc,attempts[sc],sc,jpegFrames[sc],sc,ltcFrames[sc],sc,oversize[sc],
-            sc,attempts[sc]?sumUs[sc]/attempts[sc]:0,sc,maxUs[sc],sc,maxBytes[sc],sc,quality[sc]);
+            sc,attempts[sc]?sumUs[sc]/attempts[sc]:0,sc,maxUs[sc],sc,maxBytes[sc],sc,quality[sc],
+            sc,encoderCores[sc],sc,rawReplaced[sc],sc,rawExpired[sc],
+            sc,convertCount[sc]?convertSumUs[sc]/convertCount[sc]:0,sc,convertMaxUs[sc],
+            sc,attempts[sc]?queueSumUs[sc]/attempts[sc]:0,sc,queueMaxUs[sc]);
         fclose(f);}
 }
 bool live_submit(int sc,const u8 *frame,u32 fmt,u32 stride,u32 pts,bool wide) {
@@ -142,22 +205,12 @@ bool live_submit(int sc,const u8 *frame,u32 fmt,u32 stride,u32 pts,bool wide) {
     u64 begin=svcGetSystemTick();
     u32 w=sc?320:400;
     if(!fb_to_rgb565(rgb565,frame,fmt,w,240,stride,1))return false;
-    size_t budget=(rate*93/100/fps)*w/720;
-    size_t n=codecMode==2?0:live_jpeg_encode_scaled(rgb565,w,240,quality[sc],encoded,budget);
-    if(codecMode!=2) {
-        if(!n){oversize[sc]++;quality[sc]=quality[sc]>16?quality[sc]-6:10;spare[sc]=0;}
-        else if(n<budget*9/10){if(++spare[sc]>=8){if(quality[sc]<85)quality[sc]++;spare[sc]=0;}}
-        else spare[sc]=0;
-    }
-    if(n)jpegFrames[sc]++;
-    if(!n && codecMode!=0){n=live_encode(&scratch,rgb565,w,240,budget,encoded,sizeof encoded);if(n)ltcFrames[sc]++;}
-    u32 us=(u32)((svcGetSystemTick()-begin)*1000000/SYSCLOCK_ARM11);
-    attempts[sc]++;sumUs[sc]+=us;if(us>maxUs[sc])maxUs[sc]=us;
-    if(n>maxBytes[sc])maxBytes[sc]=(u32)n;
-    if(!n)return false;
     LightLock_Lock(&lock);
-    if(lengths[sc])replaced++;
-    memcpy(pending[sc],encoded,n);lengths[sc]=(u32)n;stamps[sc]=pts;
+    if(rawValid[sc])rawReplaced[sc]++;
+    memcpy(rawPending[sc],rgb565,w*240*2);rawPts[sc]=pts;rawQueuedAt[sc]=svcGetSystemTick();rawValid[sc]=true;
     LightLock_Unlock(&lock);
+    LightEvent_Signal(&rawEvent[sc]);
+    u32 us=(u32)((svcGetSystemTick()-begin)*1000000/SYSCLOCK_ARM11);
+    convertCount[sc]++;convertSumUs[sc]+=us;if(us>convertMaxUs[sc])convertMaxUs[sc]=us;
     return true;
 }

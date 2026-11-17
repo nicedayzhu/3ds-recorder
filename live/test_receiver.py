@@ -1,12 +1,26 @@
 import struct
 import unittest
-from receiver import Assembler,HEADER,CHUNK,write_frame
+from receiver import Assembler,HEADER,CHUNK,write_frame,RelativeDelay,compose
 
 def fragments(seq=1,session=1):
     data=b'x'*3000
     return [HEADER.pack(b'R3LP',session,seq,123,0,len(data),off,30)+data[off:off+CHUNK]
             for off in range(0,len(data),CHUNK)]
 class TestReassembly(unittest.TestCase):
+    def test_relative_delay_wrap_and_session_reset(self):
+        d=RelativeDelay()
+        self.assertEqual(d.sample(1,0xfffffff0,10),0)
+        self.assertAlmostEqual(d.sample(1,0x00000010,10.020032),20)
+        self.assertAlmostEqual(d.sample(1,0xfffffff8,10.020040),20.032)
+        self.assertEqual(d.sample(2,1234,99),0)
+    def test_composition_keeps_screen_pixels_and_bottom_borders(self):
+        top=b'\x10\x20\x30'*(400*240);bottom=b'\x40\x50\x60'*(320*240)
+        out=compose(top,bottom)
+        self.assertEqual(len(out),400*480*3);self.assertEqual(out[:len(top)],top)
+        for y in (240,479):
+            row=out[y*1200:(y+1)*1200]
+            self.assertEqual(row[:120],bytes(120));self.assertEqual(row[120:1080],bottom[:960])
+            self.assertEqual(row[1080:],bytes(120))
     def test_short_pipe_writes(self):
         class Pipe:
             def __init__(self):self.data=bytearray()
@@ -24,6 +38,25 @@ class TestReassembly(unittest.TestCase):
         out=None
         for p in fragments(2):out=a.feed(p,.05)
         self.assertEqual(out,(0,b'x'*3000))
+        self.assertEqual(a.metrics['incomplete_frames'],1)
+        self.assertEqual(a.metrics['missing_fragments'],1)
+        self.assertEqual(a.metrics['missing_one'],1)
+    def test_loss_metrics_distinguish_reorder_from_missing(self):
+        a=Assembler();p=fragments()
+        for i in (0,2,2,1):a.feed(p[i],.01)
+        self.assertEqual(a.metrics['reordered_packets'],1)
+        self.assertEqual(a.metrics['duplicate_packets'],1)
+        for packet in fragments(2):a.feed(packet,.02)
+        a.feed(p[0],.03)
+        self.assertEqual(a.metrics['late_packets'],1)
+        self.assertEqual(a.metrics['missing_fragments'],0)
+    def test_expiry_counted_only_once(self):
+        a=Assembler();p=fragments();a.feed(p[0],0)
+        a.feed(p[1],.2);a.feed(p[2],.21)
+        for packet in fragments(2):a.feed(packet,.3)
+        self.assertEqual(a.metrics['incomplete_frames'],1)
+        self.assertEqual(a.metrics['expired_frames'],1)
+        self.assertEqual(a.metrics['missing_fragments'],2)
     def test_invalid_and_timeout(self):
         a=Assembler();p=fragments();self.assertIsNone(a.feed(p[0],0))
         self.assertIsNone(a.feed(p[1],1));self.assertIsNone(a.feed(p[2],1))

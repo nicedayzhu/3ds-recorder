@@ -14,6 +14,7 @@ def main():
     p.add_argument('--sender',required=True,help='3DS IPv4 address')
     p.add_argument('--fps',type=int,choices=(24,30),default=30)
     p.add_argument('--seconds',type=float,default=0)
+    p.add_argument('--preview',action='store_true',help='Open a direct preview alongside RTSP output')
     p.add_argument('--stats',default=str(ROOT/'live/build/received.csv'))
     p.add_argument('--mediamtx',type=Path,default=ROOT/'live/build/tools/mediamtx/mediamtx.exe')
     a=p.parse_args()
@@ -35,6 +36,7 @@ def main():
         else:raise RuntimeError('MediaMTX did not listen within 5 seconds')
         args=[sys.executable,'-u',str(ROOT/'live/receiver.py'),'--sender',a.sender,'--fps',str(a.fps),
               '--seconds',str(a.seconds),'--stats',a.stats]
+        if a.preview:args.append('--preview')
         receiver=subprocess.Popen(args,cwd=ROOT)
         print('OBS Media Source: rtsp://127.0.0.1:8554/3ds',flush=True)
         result=receiver.wait()

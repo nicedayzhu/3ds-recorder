@@ -16,7 +16,7 @@ TARGET          := 3ds-recorder
 APP_VERSION := 1.3.0
 # "beta" for the open beta, empty for a release: shown next to the version on the panel
 APP_CHANNEL     :=
-APP_TITLE       := 3DS Live R3
+APP_TITLE       := 3DS Live R4
 APP_DESCRIPTION := Dual-screen streaming test
 APP_AUTHOR      := 3ds-screen-recorder
 BUILD           := build

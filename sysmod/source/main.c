@@ -1601,11 +1601,8 @@ static void EncodeSlot(Slot *s, bool busy)
 {
     if (g_live)
     {
-        if (live_submit(s->screen, s->buf, s->fmt, s->stride, s->timeUs, s->wide))
-        {
-            if (s->screen) g_shared.framesBot++; else g_shared.framesTop++;
-        }
-        else g_dropped++;
+        if (!live_submit(s->screen, s->buf, s->fmt, s->stride, s->timeUs, s->wide))g_dropped++;
+        g_shared.framesTop=live_encoded_frames(0);g_shared.framesBot=live_encoded_frames(1);
         return;
     }
     const int sc = s->screen;
@@ -4923,7 +4920,8 @@ static void StopRecording(const char *why, bool releaseFirst)
             s->state=0;
         }
         live_stop();
-        Log("live stopped (%s): encoded %lu/%lu; max encode us %lu/%lu; dropped %lu",why,
+        g_shared.framesTop=live_encoded_frames(0);g_shared.framesBot=live_encoded_frames(1);
+        Log("live stopped (%s): encoded %lu/%lu; max capture-submit us %lu/%lu; dropped %lu",why,
             g_shared.framesTop,g_shared.framesBot,g_encodeMaxUs[0],g_encodeMaxUs[1],g_dropped);
         g_live=false;g_ring=NULL;BigFreeAll();g_appPid=g_appBase=0;
         CpuBoost(false);SetBoost(false,"live stopped");g_convHold=false;

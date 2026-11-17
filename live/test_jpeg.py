@@ -1,6 +1,8 @@
 """Exercise the same embedded JPEG encoder with byte limits and rotated input."""
 import io
 import unittest
+import ctypes as C
+from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageDraw
 from codec import Codec
 from evaluate import fixture
@@ -47,5 +49,24 @@ class TestJPEG(unittest.TestCase):
             self.assertGreater(sizes[-1],sizes[0])
             # At q50 the custom table is identical to the original medium table.
             self.assertEqual(self.codec.jpeg(im,40000,50,scaled=True),self.codec.jpeg(im,40000,2))
+    def test_screen_contexts_encode_concurrently_without_cross_talk(self):
+        fn=self.codec.lib.live_jpeg_encode_screen
+        fn.argtypes=[C.c_uint,C.c_void_p,C.c_uint,C.c_uint,C.c_uint,C.c_void_p,C.c_size_t]
+        fn.restype=C.c_size_t
+        cases=[]
+        for screen,w in enumerate((400,320)):
+            im=fixture(w,screen);quality=(75,30)[screen]
+            expected=self.codec.jpeg(im,40000,quality,scaled=True)
+            cases.append((screen,w,quality,self.codec.pack(im),expected))
+        def worker(case):
+            screen,w,quality,raw,expected=case
+            for _ in range(100):
+                out=C.create_string_buffer(b'\xa5'*40064)
+                n=fn(screen,raw,w,240,quality,out,40000)
+                self.assertEqual(out.raw[:n],expected)
+                self.assertEqual(out.raw[40000:40064],b'\xa5'*64)
+        with ThreadPoolExecutor(max_workers=2) as pool:list(pool.map(worker,cases))
+        out=C.create_string_buffer(40000)
+        self.assertEqual(fn(2,cases[0][3],400,240,75,out,40000),0)
 
 if __name__=='__main__':unittest.main()
